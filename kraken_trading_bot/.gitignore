@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Virtual environment (regenerate from requirements.txt)
+venv/
+.venv/
+
+# Bulk data dirs (machine-local, too large for GitHub)
+analysis/
+historical_data/
+
+# Data files (CSVs are bulky, regenerable from live feeds)
+*.csv
+
+# Secrets (just in case — keys live outside the repo)
+*.gpg
+*.key
+.env

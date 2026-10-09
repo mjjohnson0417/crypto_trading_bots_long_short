@@ -1,0 +1,41 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Data files
+*.csv
+*.pkl
+*.log
+*.json
+
+# Directories with large files
+analysis/
+historical_data/
+historical_analysis/
+processed/
+backups/
+backtest/
+backtesting_env/
+logs/
+
+# Dry run results (JSON results + HTML reports)
+**/dry_run/results/
+**/dry_run/*.html
+
+# Specific large files
+technical_analysis_bot_backtest/
+predictions.csv
+dataset_regeneration.log
+order_log.json
+
+# Model files (but keep the code)
+models/**/*.pkl
+models/**/model_testing/*.csv
+
+# Keep important config files
+!config.json
+!models/indicator_schema.json

@@ -1,0 +1,3 @@
+tracking of trades in memory, in trade_state.json, reconcilliation, all need to be examined. Claude has covered up most of the problems the bot here with bolt-on code and kluges. reconcilliation needs to go away and trade_state.json needs to just be a backup of what was seen on the exchange and should be the same as the in memory dictionary. 
+
+orchestrator, persistance, and strategy as the last three things to edit

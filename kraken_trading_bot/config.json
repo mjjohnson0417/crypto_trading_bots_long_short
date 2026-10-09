@@ -1,0 +1,107 @@
+{
+  "exchange": "kraken",
+  "keys_path": "/home/jason/api/kraken/kraken_api_keys.json.gpg",
+  "symbols": [
+    "ONDO/USD",
+    "SUI/USD",
+    "HYPE/USD",
+    "AVAX/USD",
+    "SOL/USD",
+    "LINK/USD",
+    "CC/USD",
+    "ETH/USD",
+    "HBAR/USD",
+    "XLM/USD",
+    "XRP/USD"
+  ],
+  "trading": {
+    "dry_run": false,
+    "warmup_seconds": 30,
+    "max_book_age_seconds": 10,
+    "tick_interval_seconds": 1,
+    "balance_refresh_interval_seconds": 60,
+    "order_send_timeout_seconds": 10.0,
+    "exchange_sync_lookback_seconds": 1800
+  },
+  "hybrid_grid": {
+    "hysteresis_seconds": 90,
+    "ladder": {
+      "rung_count": 5,
+      "spacing_pct": 1.0,
+      "proximity_pct": 1.0
+    },
+    "chase": {
+      "enabled": false,
+      "position_size_pct": 0.0886,
+      "profit_pct": 0.3,
+      "spacing_pct": 0.6
+    },
+    "ladder_defaults": {
+      "position_size_pct": 0.0886,
+      "profit_pct": 2.0
+    }
+  },
+  "market_data": {
+    "kline_seed_interval": "15m",
+    "kline_seed_lookback": 200,
+    "trade_buffer_maxlen": 5000,
+    "ticker_buffer_maxlen": 5000,
+    "public_ping_health_max_age_seconds": 10,
+    "private_ping_health_max_age_seconds": 90,
+    "private_ping_interval_seconds": 30,
+    "ws_health_check_interval_seconds": 30,
+    "ws_unhealthy_exit_seconds": 120,
+    "dataframe_log_interval_seconds": 30
+  },
+  "indicators": {
+    "log_interval_seconds": 30
+  },
+  "telemetry": {
+    "max_disk_usage_pct": 90
+  },
+  "logging": {
+    "level": "INFO",
+    "console_logging": true,
+    "module_levels": {
+      "DataManager": "WARNING",
+      "ExchangeConnection": "WARNING",
+      "ExchangeSync": "INFO",
+      "FeeCache": "WARNING",
+      "HybridGridStrategy": "INFO",
+      "IndicatorCalculator": "WARNING",
+      "KeyLoader": "WARNING",
+      "KlineBuffer": "WARNING",
+      "OrderBookBuffer": "WARNING",
+      "OrderOperations": "INFO",
+      "PrivateMessageSorter": "WARNING",
+      "PrivateWebSocket": "WARNING",
+      "PublicMessageSorter": "WARNING",
+      "PublicWebSocket": "WARNING",
+      "RawWsLogger": "WARNING",
+      "RegimeClassifier": "WARNING",
+      "RulesTradingBot": "INFO",
+      "ShutdownManager": "WARNING",
+      "StartupReconciler": "INFO",
+      "TickerBuffer": "WARNING",
+      "TradeBuffer": "WARNING",
+      "TradingRunner": "INFO"
+    },
+    "raw_ws_logging": {
+      "enabled": true,
+      "output_path": "/mnt/externalssd/raw_ws",
+      "log_symbols": [
+        "ONDO/USD",
+        "SUI/USD",
+        "HYPE/USD",
+        "AVAX/USD",
+        "SOL/USD",
+        "LINK/USD",
+        "CC/USD",
+        "ETH/USD",
+        "HBAR/USD",
+        "XLM/USD",
+        "XRP/USD"
+      ]
+    }
+  }
+}
