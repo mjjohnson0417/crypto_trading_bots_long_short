@@ -27,6 +27,7 @@ from exchange.paper_futures import PaperFuturesAccount
 from indicators import IndicatorCalculator
 from logging_config import get_logger
 from market_data.daily_trend import DailyTrendGate
+from persistence.journal import TradeJournal
 from persistence.trade_tracker import TradeTracker
 from price_calculator import calculate_portfolio_value
 from strategy.hybrid_grid import HybridGridStrategy
@@ -90,12 +91,15 @@ class TradingRunner:
             paper_exchange=self.paper_exchange,
         )
         self.tracker = TradeTracker(state_dir=tracker_dir)
+        # Append-only record of every decision and fill (never rotated).
+        self.journal = TradeJournal(tracker_dir)
         self.indicator_calculator = IndicatorCalculator(self.symbols)
         self.strategy = HybridGridStrategy(
             symbols=self.symbols,
             config=config,
             fee_cache=self.fee_cache,
             data_manager=data_manager,
+            journal=self.journal,
         )
         # 200-day buy gate. main.py awaits daily_trend.initialize() before
         # the runner starts, so the bot never trades without it.
@@ -117,6 +121,7 @@ class TradingRunner:
                 perps=data_manager.perps,
                 taker_fee_pct=short_cfg['taker_fee_pct'],
                 state_dir='paper_trading',
+                journal=self.journal,
             )
             self.short_grid = ShortGridStrategy(
                 symbols=self.symbols,
@@ -124,6 +129,7 @@ class TradingRunner:
                 perps=data_manager.perps,
                 daily_trend=self.daily_trend,
                 account=self.short_account,
+                journal=self.journal,
             )
         else:
             self.short_account = None
@@ -163,6 +169,11 @@ class TradingRunner:
     async def start(self) -> None:
         """Bootstrap then run forever (until shutdown_event)."""
         self.logger.info("TradingRunner starting up")
+        self.journal.write(
+            'bot_start', dry_run=self.dry_run, symbols=self.symbols,
+            hybrid_grid=self.config['hybrid_grid'], daily_trend=self.config['daily_trend'],
+            short_grid=self.config['short_grid'],
+        )
 
         # Fee cache populate.
         await self.fee_cache.populate(self.symbols)
@@ -358,6 +369,11 @@ class TradingRunner:
                 timestamp=timestamp,
             )
             self._cum_qty_seen[key] = cum_qty
+            self.journal.write(
+                'fill', symbol=order['symbol'], side=side, order_id=order_id,
+                cl_ord_id=cl_ord_id, price=price, qty=delta_qty, fee=fee,
+                exchange_ts=timestamp,
+            )
 
         # Archive on sell filled.
         if is_chase_tp_sell and status == 'filled':
@@ -412,6 +428,11 @@ class TradingRunner:
         if cum_qty > prev_cum:
             delta_qty = cum_qty - prev_cum
             avg_price, fee = self._execution_price_and_fee(order)
+            self.journal.write(
+                'fill', symbol=symbol, side='sell', order_id=order_id,
+                cl_ord_id=cl_ord_id, price=avg_price, qty=delta_qty, fee=fee,
+                exchange_ts=timestamp, cycles=len(covered),
+            )
             buy_qtys = [
                 sum(float(f['qty']) for f in cycle['buy']['fills'])
                 for _buy_oid, cycle in covered
@@ -432,8 +453,34 @@ class TradingRunner:
 
         # Archive each covered cycle when the aggregate sell is filled.
         if status == 'filled':
+            self._journal_ladder_closed(symbol, order_id, covered)
             for buy_oid, _cycle in covered:
                 self.tracker.archive(buy_oid)
+
+    def _journal_ladder_closed(self, symbol: str, sell_order_id: str, covered: list) -> None:
+        """Realized P&L of an aggregate ladder sell across the cycles it closed."""
+        buy_qty = buy_cost = buy_fees = sell_qty = proceeds = sell_fees = 0.0
+        for _buy_oid, cycle in covered:
+            for f in cycle['buy']['fills']:
+                buy_qty += f['qty']
+                buy_cost += f['qty'] * f['price']
+                buy_fees += f['fee']
+            for f in cycle['sell']['fills']:
+                sell_qty += f['qty']
+                proceeds += f['qty'] * f['price']
+                sell_fees += f['fee']
+        net = proceeds - sell_fees - buy_cost - buy_fees
+        self.journal.write(
+            'ladder_closed', symbol=symbol, order_id=sell_order_id, cycles=len(covered),
+            buy_qty=buy_qty, sell_qty=sell_qty, buy_cost=buy_cost, buy_fees=buy_fees,
+            sell_proceeds=proceeds, sell_fees=sell_fees, net_pnl=net,
+            return_pct=net / buy_cost * 100 if buy_cost > 0 else None,
+        )
+        self.logger.info(
+            f"{symbol} ladder basket closed: {len(covered)} cycles, qty={sell_qty:.8g}, "
+            f"cost=${buy_cost:.2f} + fees ${buy_fees + sell_fees:.2f}, "
+            f"proceeds=${proceeds:.2f}, net=${net:+.2f}"
+        )
 
     @staticmethod
     def _execution_price_and_fee(order: dict):
@@ -545,19 +592,36 @@ class TradingRunner:
             buys_allowed=buys_allowed,
             buy_gate_reason=buy_gate_reason,
         )
+        if actions:
+            counts: dict = {}
+            for a in actions:
+                k = f"{a['action']}:{a['reason']}"
+                counts[k] = counts[k] + 1 if k in counts else 1
+            self.logger.info(
+                f"{symbol} decisions mid={mid_price:.8g} regime={actions[0]['regime']} "
+                f"buys={'on' if buys_allowed else 'off'}: "
+                + ', '.join(f"{n}× {k}" for k, n in counts.items())
+            )
         for action in actions:
+            error = None
             try:
                 await self._dispatch_action(action)
             except Exception as e:
+                error = str(e)
                 self.logger.error(
                     f"Action dispatch error {action}: {e}", exc_info=True,
                 )
+            self.journal.write(
+                'ladder_action', mid=mid_price, buys_allowed=buys_allowed,
+                error=error, **action,
+            )
+            if error is not None:
                 # On sell insufficient, immediately force a balance-based position reconciliation.
                 # This corrects the tracker (archives phantom cycles whose tokens are gone per exchange)
                 # so subsequent ticks do not keep re-emitting the same failing sell.
                 kind = action.get('action')
                 if kind in ('place_market_sell', 'place_limit_sell'):
-                    err = str(e).lower()
+                    err = error.lower()
                     if 'insufficient' in err or 'funds' in err:
                         sym = action.get('symbol')
                         self.logger.warning(f"{sym} sell hit insufficient funds — forcing tracker <-> exchange balance reconciliation")

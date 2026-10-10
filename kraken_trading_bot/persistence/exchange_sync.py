@@ -226,6 +226,13 @@ class ExchangeSyncTask:
                 continue
             cl = o.get("clientOrderId") or ""
             sym = o.get("symbol")
+            # A closed buy that executed nothing is a canceled rung, not a
+            # position: adopting it only to prune it again was pure churn.
+            if o["filled"] is None:
+                self.logger.error(f"closed buy {oid} {sym} has no 'filled' value; not adopted")
+                continue
+            if float(o["filled"]) <= 0:
+                continue
             status = self._normalize_status(o.get("status"))
             amt = float(o.get("amount") or 0.0)
             px = float(o.get("average") or o.get("price") or 0.0)
@@ -242,11 +249,14 @@ class ExchangeSyncTask:
                 for soid, so in closed_by_id.items():
                     if so.get("side") != "sell" or so.get("symbol") != sym:
                         continue
+                    # A sell that executed nothing can't complete a cycle.
+                    if so["filled"] is None or float(so["filled"]) <= 0:
+                        continue
                     scl = so.get("clientOrderId") or ""
                     if scl.startswith("a-") or (scl.startswith("s-") and abs(float(so.get("filled") or 0) - filled) / max(filled or 1, 1e-9) < 0.01):
                         sstatus = self._normalize_status(so.get("status"))
                         sprice = float(so.get("average") or so.get("price") or 0.0)
-                        samt = float(so.get("filled") or so.get("amount") or filled)
+                        samt = float(so["filled"])
                         sts = so.get("datetime") or ts
                         try:
                             self.tracker.add_sell(oid, soid, scl, so.get("type") or "market", samt, sprice, sts, sstatus)

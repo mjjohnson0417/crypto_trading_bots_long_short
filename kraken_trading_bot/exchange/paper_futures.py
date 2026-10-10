@@ -50,9 +50,10 @@ def _floor_hour(dt: datetime) -> datetime:
 
 class PaperFuturesAccount:
 
-    def __init__(self, *, perps, taker_fee_pct, state_dir):
+    def __init__(self, *, perps, taker_fee_pct, state_dir, journal):
         self.logger = get_logger('PaperFutures')
         self.perps = perps
+        self.journal = journal
         self.taker_fee_pct = float(taker_fee_pct)
         if self.taker_fee_pct < 0:
             raise ValueError("short_grid.taker_fee_pct must be >= 0")
@@ -154,9 +155,11 @@ class PaperFuturesAccount:
     # ── Open / cover ────────────────────────────────────────────────────
 
     def open_short(self, *, symbol: str, product: str, level: int, usd: float,
-                   ref_price: float, now: datetime):
-        """Sell `usd` worth of `product` at market. Returns the position
-        dict, or None if usd rounds below one contract step."""
+                   ref_price: float, now: datetime, total_equity: float,
+                   notional_before: float):
+        """Sell `usd` worth of `product` at market. `ref_price` is the perp
+        mid that triggered the entry. Returns the position dict, or None if
+        usd rounds below one contract step."""
         qty = self._qty_for_usd(product, usd, ref_price)
         if qty <= 0:
             self.logger.warning(
@@ -183,16 +186,26 @@ class PaperFuturesAccount:
         }
         self.open.append(pos)
         self.save()
+        slippage = (ref_price - price) / ref_price * 100   # + = filled worse than the mid
+        self.journal.write(
+            'short_open', symbol=symbol, product=product, id=pos['id'], level=int(level),
+            qty=qty, trigger_mid=ref_price, fill_price=price, slippage_pct=slippage,
+            fee=fee, usd_target=usd, total_equity=total_equity,
+            notional_before=notional_before,
+        )
         self.logger.info(
             f"PAPER SHORT open {symbol} ({product}) qty={qty:.8g} @ {price:.8g} "
+            f"(trigger mid {ref_price:.8g}, slippage {slippage:+.3f}%) "
             f"notional=${qty * price:.2f} fee=${fee:.4f} level={level} "
             f"open_shorts={len(self.open)}"
         )
         return pos
 
-    def cover(self, pos: dict, reason: str, now: datetime) -> None:
-        """Buy back `pos` at market and record it in the history file."""
+    def cover(self, pos: dict, reason: str, now: datetime, trigger_mid: float) -> None:
+        """Buy back `pos` at market and record it in the history file.
+        `trigger_mid` is the perp mid that triggered the stop / trail."""
         price = self._walk(pos['product'], 'ask', pos['qty'])
+        slippage = (price - trigger_mid) / trigger_mid * 100   # + = filled worse than the mid
         fee = pos['qty'] * price * self.taker_fee_pct / 100.0
         gross = pos['qty'] * (pos['entry_price'] - price)
         self.cash += gross - fee
@@ -205,6 +218,8 @@ class PaperFuturesAccount:
         row.update({
             'closed_at': _iso(now),
             'reason': reason,
+            'trigger_mid': trigger_mid,
+            'exit_slippage_pct': slippage,
             'exit_price': price,
             'exit_fee': fee,
             'gross_pnl': gross,
@@ -214,6 +229,14 @@ class PaperFuturesAccount:
         with open(self.history_file, 'a') as f:
             f.write(json.dumps(row) + '\n')
         self.save()
+        self.journal.write(
+            'short_cover', symbol=pos['symbol'], id=pos['id'], reason=reason,
+            trigger_mid=trigger_mid, fill_price=price, slippage_pct=slippage,
+            entry_price=pos['entry_price'], qty=pos['qty'], gross_pnl=gross,
+            fees=pos['entry_fee'] + fee, funding=pos['funding'], net_pnl=net,
+            return_pct=row['return_pct'], opened_at=pos['opened_at'],
+            activated_at=pos['activated_at'], trough=pos['trough'],
+        )
         self.logger.info(
             f"PAPER SHORT cover ({reason}) {pos['symbol']} qty={pos['qty']:.8g} "
             f"entry={pos['entry_price']:.8g} exit={price:.8g} "
@@ -237,17 +260,22 @@ class PaperFuturesAccount:
                 f"(bot was down); charging the missed hours at the current rates"
             )
         total = 0.0
+        per_position = []
         for pos in self.open:
             ticker = self.perps.latest_ticker(pos['product'])
             rate = float(ticker['relative_funding_rate'])
             amount = pos['qty'] * float(ticker['markPrice']) * rate * hours
             pos['funding'] += amount
             total += amount
+            per_position.append({'id': pos['id'], 'symbol': pos['symbol'],
+                                 'rate': rate, 'hours': hours, 'amount': amount})
         self.cash += total
         self.funding_received += total
         self.last_funding_hour = hour
         self.save()
         if self.open:
+            self.journal.write('short_funding', hour=_iso(hour), total=total,
+                               positions=per_position)
             self.logger.info(
                 f"PAPER shorts funding {_iso(hour)}: ${total:+.4f} on "
                 f"{len(self.open)} shorts (total ${self.funding_received:+.4f})"

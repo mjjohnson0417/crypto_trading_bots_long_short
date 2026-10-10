@@ -106,6 +106,27 @@ Live mode uses `live_trading/` for the tracker. Paper and live state never mix.
 - **Task deaths:** `main.py` also exits 1 if the trading or sync task dies.
 - **`[PerpStatus]`** logs basis, funding and book health every 5 min.
 
+## Trade journal (the record for analysis)
+
+`persistence/journal.py` appends one JSON line per event to
+`<state_dir>/journal.jsonl` (`paper_trading/` in dry run, `live_trading/` live).
+Never rotated — the text log keeps only ~30 MB (5 MB × 6). Use the journal, not
+the text log, to reconstruct trades.
+
+- **Decisions:** `ladder_action` per placed/canceled order with `reason`
+  (`build`, `refill`, `ratchet_up`, `excess_rung`, `enter_strong_uptrend`,
+  `enter_downtrend`, `exit_downtrend`, `buy_gate_paused`, `aggregate_target`, chase
+  reasons), `mid`, `regime`, `buys_allowed`, dispatch `error`. The aggregate sell
+  also has `avg_cost`, `target_price`, `cycles`, `buy_fees`, `taker_fee_pct`.
+- **State:** `regime_change`, `buy_gate`, `short_gate` (flips only), `bot_start` (settings).
+- **Results:** `fill` (every fill, both sides), `ladder_closed` (realized P&L of each
+  aggregate sell), `short_open` / `short_activated` / `short_cover` (with trigger mid,
+  fill price, slippage, net P&L), `short_funding` (hourly).
+- The text log gets one `<symbol> decisions mid=… regime=… buys=…: N× action:reason`
+  line per tick that acts, and `regime A → B` lines.
+- `order_cycles_history.json` still collects zero-fill canceled rungs (archived on
+  cancel; reconcilers read it for known order ids), so it is noisy; the journal is clean.
+
 ## Order tracking and reconciliation
 
 - **Tracker** (`persistence/trade_tracker.py`): `order_cycles.json`, keyed by

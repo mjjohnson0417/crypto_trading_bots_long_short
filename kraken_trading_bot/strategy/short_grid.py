@@ -32,8 +32,9 @@ from logging_config import get_logger
 
 class ShortGridStrategy:
 
-    def __init__(self, *, symbols, config, perps, daily_trend, account):
+    def __init__(self, *, symbols, config, perps, daily_trend, account, journal):
         self.logger = get_logger('ShortGrid')
+        self.journal = journal
         self.perps = perps
         self.daily_trend = daily_trend
         self.account = account
@@ -134,6 +135,7 @@ class ShortGridStrategy:
             self.logger.info(
                 f"{symbol} shorts {'ENABLED' if allowed else 'DISABLED'} — {reason}"
             )
+            self.journal.write('short_gate', symbol=symbol, allowed=allowed, reason=reason)
             self.gate_allowed[symbol] = allowed
 
         if prev is None or level >= prev or not allowed:
@@ -153,7 +155,8 @@ class ShortGridStrategy:
             return
         self.account.open_short(
             symbol=symbol, product=self.product[symbol], level=level,
-            usd=usd, ref_price=mid, now=now,
+            usd=usd, ref_price=mid, now=now, total_equity=total,
+            notional_before=notional,
         )
 
     def _manage_exit(self, pos: dict, mid: float, now: datetime) -> None:
@@ -164,17 +167,19 @@ class ShortGridStrategy:
                 pos['trough'] = mid
                 pos['activated_at'] = now.isoformat().replace('+00:00', 'Z')
                 self.account.save()
+                self.journal.write('short_activated', symbol=pos['symbol'], id=pos['id'],
+                                   entry=entry, mid=mid)
                 self.logger.info(
                     f"PAPER SHORT trail activated {pos['symbol']} entry={entry:.8g} "
                     f"mid={mid:.8g} ({(1 - mid / entry) * 100:.2f}% ahead)"
                 )
             elif mid >= entry * (1 + self.stop_pct / 100.0):
-                self.account.cover(pos, 'stop', now)
+                self.account.cover(pos, 'stop', now, mid)
             return
         floor_px = entry * (1 - (self.round_trip_fee_pct + self.trail_floor_pct) / 100.0)
         cover_px = min(pos['trough'] * (1 + self.trail_pct / 100.0), floor_px)
         if mid >= cover_px:
-            self.account.cover(pos, 'trail', now)
+            self.account.cover(pos, 'trail', now, mid)
         elif mid < pos['trough']:
             pos['trough'] = mid
             self.account.save()

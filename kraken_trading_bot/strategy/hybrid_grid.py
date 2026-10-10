@@ -8,7 +8,8 @@ False, no new buys are placed, resting buys are canceled, and exits
 still run. Returns a list of plain-dict
 actions for the runner to dispatch against `order_ops`.
 
-Action dicts:
+Action dicts (every action also carries "reason" and "regime" for the
+trade journal; the runner ignores keys it does not dispatch on):
     {"action": "place_market_buy", "symbol", "qty", "cl_ord_id"}
     {"action": "place_limit_buy",  "symbol", "qty", "price", "cl_ord_id"}
     {"action": "place_limit_sell", "symbol", "qty", "price", "cl_ord_id"}
@@ -61,11 +62,12 @@ class _BuyGateState:
 
 class HybridGridStrategy:
 
-    def __init__(self, symbols, config, fee_cache, data_manager):
+    def __init__(self, symbols, config, fee_cache, data_manager, journal):
         self.logger = get_logger('HybridGridStrategy')
         self.symbols = [s.upper() for s in symbols]
         self.fee_cache = fee_cache
         self.data_manager = data_manager
+        self.journal = journal
 
         hcfg = config['hybrid_grid']
         h_ladder = hcfg['ladder']
@@ -99,6 +101,8 @@ class HybridGridStrategy:
         self.chase = {s: _ChaseState() for s in self.symbols}
         self.ladder = {s: _LadderState() for s in self.symbols}
         self.buy_gate = {s: _BuyGateState() for s in self.symbols}
+        # Last confirmed regime per symbol, for transition logging.
+        self.regime = {s: None for s in self.symbols}
 
     # ── Public entry point ───────────────────────────────────────────────
 
@@ -106,6 +110,11 @@ class HybridGridStrategy:
                  buys_allowed, buy_gate_reason) -> List[dict]:
         actions: List[dict] = []
         state = self.classifiers[symbol].update(indicators, now)
+        prev_state = self.regime[symbol]
+        if state != prev_state:
+            self.logger.info(f"{symbol} regime {prev_state} → {state}")
+            self.journal.write('regime_change', symbol=symbol, **{'from': prev_state, 'to': state})
+            self.regime[symbol] = state
 
         actions.extend(self._handle_state_transitions(symbol, state, mid_price, orders))
 
@@ -127,6 +136,8 @@ class HybridGridStrategy:
                 )
 
         actions.extend(self._exit_decisions(symbol, mid_price, orders))
+        for a in actions:
+            a['regime'] = state
         return actions
 
     # ── cl_ord_id encode / decode (strategy-private) ─────────────────────
@@ -179,8 +190,8 @@ class HybridGridStrategy:
             chase.strong_uptrend_start_price = None
             # Cancel any open chase buys on exit from STRONG_UPTREND.
             for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'chase'):
-                actions.append({"action": "cancel_order",
-                                "symbol": symbol, "order_id": buy_oid})
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": buy_oid, "reason": "exit_strong_uptrend"})
 
         chase.last_confirmed_state = state
 
@@ -189,8 +200,8 @@ class HybridGridStrategy:
         prev = ladder.last_confirmed_state
         if state == STATE_STRONG_UPTREND:
             for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'ladder'):
-                actions.append({"action": "cancel_order",
-                                "symbol": symbol, "order_id": buy_oid})
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": buy_oid, "reason": "enter_strong_uptrend"})
             ladder.anchor_price = None
             ladder.spacing_distance = None
             ladder.is_anchored = False
@@ -198,8 +209,8 @@ class HybridGridStrategy:
         elif (state in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)
               and prev not in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)):
             for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'ladder'):
-                actions.append({"action": "cancel_order",
-                                "symbol": symbol, "order_id": buy_oid})
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": buy_oid, "reason": "enter_downtrend"})
             ladder.anchor_price = float(mid_price)
             ladder.is_anchored = True
             ladder.spacing_distance = float(mid_price) * (self.ladder_spacing_pct / 100.0)
@@ -207,8 +218,8 @@ class HybridGridStrategy:
         elif (prev in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)
               and state not in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)):
             for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'ladder'):
-                actions.append({"action": "cancel_order",
-                                "symbol": symbol, "order_id": buy_oid})
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": buy_oid, "reason": "exit_downtrend"})
             ladder.anchor_price = None
             ladder.spacing_distance = None
             ladder.is_anchored = False
@@ -228,6 +239,7 @@ class HybridGridStrategy:
         flipped = gate.allowed is not False
         if flipped:
             self.logger.warning(f"{symbol} buys PAUSED — {reason}")
+            self.journal.write('buy_gate', symbol=symbol, allowed=False, reason=reason)
         gate.allowed = False
         self.ladder[symbol].last_adjust_price = None
 
@@ -240,8 +252,8 @@ class HybridGridStrategy:
         actions: List[dict] = []
         for rule in ('ladder', 'chase'):
             for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, rule):
-                actions.append({"action": "cancel_order",
-                                "symbol": symbol, "order_id": buy_oid})
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": buy_oid, "reason": "buy_gate_paused"})
         if actions:
             self.logger.info(
                 f"{symbol} buy gate canceling {len(actions)} resting buy(s)"
@@ -252,6 +264,7 @@ class HybridGridStrategy:
         gate = self.buy_gate[symbol]
         if gate.allowed is not True:
             self.logger.info(f"{symbol} buys ALLOWED — {reason}")
+            self.journal.write('buy_gate', symbol=symbol, allowed=True, reason=reason)
         gate.allowed = True
         gate.last_cancel_sweep = None
 
@@ -277,7 +290,7 @@ class HybridGridStrategy:
         qty = size_usd / mid_price
         cl_ord_id = self._encode_buy_cl_ord_id('chase', self.chase_profit_pct)
         return [{"action": "place_market_buy", "symbol": symbol,
-                 "qty": qty, "cl_ord_id": cl_ord_id}]
+                 "qty": qty, "cl_ord_id": cl_ord_id, "reason": "chase_entry"}]
 
     # ── Ladder decisions ────────────────────────────────────────────────
 
@@ -330,23 +343,34 @@ class HybridGridStrategy:
 
         # Excess: cancel lowest first.
         cancels_prices: List[float] = []
+        cancel_reason: dict = {}
         if active > target:
-            cancels_prices.extend(below[:active - target])
+            for price in below[:active - target]:
+                cancels_prices.append(price)
+                cancel_reason[price] = "excess_rung"
             active -= len(cancels_prices)
 
         missing = max(0, target - active)
         places_prices: List[float] = []
+        place_reason: dict = {}
+        fill_reason = "build" if active == 0 else "refill"
 
         if direction == "up":
-            places_prices.extend(candidates[:missing])
+            for price in candidates[:missing]:
+                places_prices.append(price)
+                place_reason[price] = fill_reason
             if missing == 0 and candidates and below:
                 new_top = candidates[0]
                 if new_top > max(below):
                     places_prices.append(new_top)
+                    place_reason[new_top] = "ratchet_up"
                     cancels_prices.append(below[0])
+                    cancel_reason[below[0]] = "ratchet_up"
         else:
             bottom_up = sorted(candidates)
-            places_prices.extend(bottom_up[:missing])
+            for price in bottom_up[:missing]:
+                places_prices.append(price)
+                place_reason[price] = fill_reason
 
         places_prices = [p for p in places_prices if p < mid_price]
         places_prices = sorted(set(places_prices), reverse=True)
@@ -360,8 +384,8 @@ class HybridGridStrategy:
         for price in cancels_prices:
             oid = price_to_oid.get(price)
             if oid:
-                actions.append({"action": "cancel_order",
-                                "symbol": symbol, "order_id": oid})
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": oid, "reason": cancel_reason[price]})
 
         # Emit places. Sizing per rung.
         for price in places_prices:
@@ -371,7 +395,8 @@ class HybridGridStrategy:
             qty = size_usd / price
             cl_ord_id = self._encode_buy_cl_ord_id('ladder', self.ladder_profit_pct)
             actions.append({"action": "place_limit_buy", "symbol": symbol,
-                            "qty": qty, "price": price, "cl_ord_id": cl_ord_id})
+                            "qty": qty, "price": price, "cl_ord_id": cl_ord_id,
+                            "reason": place_reason[price]})
 
         return actions
 
@@ -440,7 +465,7 @@ class HybridGridStrategy:
             actions.append({"action": "place_limit_sell", "symbol": symbol,
                             "qty": total_qty, "price": tp_price,
                             "cl_ord_id": cl_ord_id,
-                            "parent_buy_order_id": buy_oid})
+                            "parent_buy_order_id": buy_oid, "reason": "chase_tp"})
         return actions
 
     def _ladder_exits(self, symbol, mid_price, orders) -> List[dict]:
@@ -451,6 +476,7 @@ class HybridGridStrategy:
         total_qty = 0.0
         total_value = 0.0
         total_buy_fee = 0.0
+        n_cycles = 0
         for _buy_oid, cycle in orders.items():
             if cycle['symbol'] != symbol:
                 continue
@@ -462,6 +488,7 @@ class HybridGridStrategy:
             meta = self._decode_buy_cl_ord_id(buy['cl_ord_id'])
             if meta is None or meta[0] != 'ladder':
                 continue
+            n_cycles += 1
             for f in buy['fills']:
                 total_qty += f['qty']
                 total_value += f['price'] * f['qty']
@@ -483,7 +510,10 @@ class HybridGridStrategy:
             return []
         cl_ord_id = self._encode_agg_sell_cl_ord_id()
         return [{"action": "place_market_sell", "symbol": symbol,
-                 "qty": total_qty, "cl_ord_id": cl_ord_id}]
+                 "qty": total_qty, "cl_ord_id": cl_ord_id,
+                 "reason": "aggregate_target", "avg_cost": avg_cost,
+                 "target_price": target_price, "cycles": n_cycles,
+                 "buy_fees": total_buy_fee, "taker_fee_pct": taker_fee}]
 
     @staticmethod
     def _encode_agg_sell_cl_ord_id() -> str:
