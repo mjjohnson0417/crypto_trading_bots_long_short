@@ -27,7 +27,7 @@ from `crypto_trading_bots@2df2582`. All long/short development happens here.
 
 ## What the bot does now
 
-Spot DCA ladder on Kraken (`config.json` `symbols`, 11 tokens) with a daily
+Spot DCA ladder on Kraken (`config.json` `symbols`, 10 tokens; CC removed 2026-10-10) with a daily
 trend gate. Strategy: `strategy/hybrid_grid.py`, runner:
 `orchestrator/trading_runner.py`.
 
@@ -47,14 +47,32 @@ trend gate. Strategy: `strategy/hybrid_grid.py`, runner:
   - SMA50 is computed and logged for the future short gate.
 - **Fees** (`exchange/fee_cache.py`): account volume-tier rates from Kraken, refreshed hourly. As of 2026-10-10: maker 0.20%, taker 0.35%. Fill fees are read from Kraken WS v2 `fees` (per execution) and `last_price`; there is **no `fee` field**. The original bot reads `fee`, so it records every fill fee as $0.
 
-## Planned next (from strategy_lab "suggested rules")
+## Paper short grid (dry run only)
 
-Trailing short grid on **Kraken Futures perps** while the previous daily close is below the 50-day SMA:
-- Entries: one short each time price crosses a 1% level downward.
-- Size: 0.5% of equity per short, total cap 30%.
-- Exits: 3% hard stop; trailing cover activates at +5% (plus fees), trails 8%, floor 0.5%.
+Trailing short grid on **Kraken Futures perps**, a copy of strategy_lab's
+`lab/short_grid_core.py` mode 3 (settings from `analysis/export_rules_chart.py`).
+Code: `strategy/short_grid.py` (rules) + `exchange/paper_futures.py` (paper
+account); config `short_grid`; runner task `short_grid`.
 
-The user's Kraken account has perps access (perp wallet unfunded). Order placement and cancel code for futures comes later; it needs separate futures API keys. The lab priced shorts on spot candles and modeled no margin, liquidation or basis, so paper-trade shorts on real perp data before going live.
+- **Gate** (`short_grid.gate`): `below_short_sma` = previous daily close < 50-day SMA
+  (the backtested choice); `below_either_sma` = below the 50d or the 200d. Stale
+  daily data (> 26h) blocks new shorts. Shorts are NOT closed when the gate turns off.
+- **Entry:** once per minute (lab used 1-minute closes) on the perp book mid:
+  level = floor(ln(mid)/ln(1.01)); a cross down into a level with no open short
+  opens one. Size 0.5% of total equity; skipped if short notional would exceed
+  30% of total equity. Total equity = spot paper equity + short equity (one pot).
+- **Exit,** each short on its own, every tick: 3% hard stop until ahead by
+  5% + round-trip fees (2 × 0.05% taker); then the stop is dropped and it covers
+  when mid rises 8% off its trough, never below 0.5% + fees profit.
+- **Fills** walk the live perp book (taker). Qty rounds down to the contract
+  precision. **Funding** is credited hourly: qty × mark × `relative_funding_rate`.
+- **Not modelled:** margin, liquidation (initial margin is only reported).
+- **Files** in `paper_trading/`: `paper_shorts.json` (ledger + open shorts),
+  `paper_shorts_history.jsonl` (each covered short), `paper_shorts_equity.jsonl`
+  (one line per minute). Log line: `PAPER shorts ... TOTAL=$`.
+- **Live mode** refuses to start with `short_grid.enabled`: no live futures order
+  code exists. That needs separate Futures API keys (perp wallet unfunded); the
+  user will add keys once paper results show the strategy works.
 
 ## Dry run = paper trading
 

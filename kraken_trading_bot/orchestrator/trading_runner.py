@@ -23,12 +23,14 @@ from datetime import datetime, timezone
 from exchange.fee_cache import FeeCache
 from exchange.order_operations import OrderOperations
 from exchange.paper_exchange import PaperExchange
+from exchange.paper_futures import PaperFuturesAccount
 from indicators import IndicatorCalculator
 from logging_config import get_logger
 from market_data.daily_trend import DailyTrendGate
 from persistence.trade_tracker import TradeTracker
 from price_calculator import calculate_portfolio_value
 from strategy.hybrid_grid import HybridGridStrategy
+from strategy.short_grid import ShortGridStrategy
 
 
 class TradingRunner:
@@ -102,6 +104,31 @@ class TradingRunner:
             config['daily_trend'],
         )
 
+        # Trailing short grid on perps. Paper only: there is no live
+        # Kraken Futures order code, so live mode refuses to run it.
+        short_cfg = config['short_grid']
+        if bool(short_cfg['enabled']):
+            if not self.dry_run:
+                raise ValueError(
+                    "short_grid.enabled requires trading.dry_run: no live "
+                    "Kraken Futures order code exists yet"
+                )
+            self.short_account = PaperFuturesAccount(
+                perps=data_manager.perps,
+                taker_fee_pct=short_cfg['taker_fee_pct'],
+                state_dir='paper_trading',
+            )
+            self.short_grid = ShortGridStrategy(
+                symbols=self.symbols,
+                config=short_cfg,
+                perps=data_manager.perps,
+                daily_trend=self.daily_trend,
+                account=self.short_account,
+            )
+        else:
+            self.short_account = None
+            self.short_grid = None
+
         # Runtime state.
         self.cached_balance = 0.0
         self.placement_paused = False
@@ -169,6 +196,8 @@ class TradingRunner:
             tasks.append(asyncio.create_task(
                 self.paper_exchange.run(self.shutdown_event), name='paper_fills',
             ))
+        if self.short_grid is not None:
+            tasks.append(asyncio.create_task(self._short_grid_loop(), name='short_grid'))
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
@@ -540,6 +569,20 @@ class TradingRunner:
                         except Exception as recon_e:
                             self.logger.error(f"Forced position/balance recon after sell error failed: {recon_e}")
 
+    async def _short_grid_loop(self) -> None:
+        """Paper short grid: same cadence, warmup and shutdown pause as
+        the spot tick loop. Sized on spot paper equity (cached_balance,
+        refreshed every balance_refresh_interval) + short equity."""
+        while not self.shutdown_event.is_set():
+            try:
+                now = datetime.now(timezone.utc)
+                if (not self.placement_paused
+                        and (now - self.start_time).total_seconds() >= self.warmup_seconds):
+                    self.short_grid.step(now, self.cached_balance)
+            except Exception as e:
+                self.logger.error(f"Short grid loop error: {e}", exc_info=True)
+            await asyncio.sleep(self.tick_interval_seconds)
+
     async def _dispatch_action(self, action: dict) -> None:
         kind = action.get('action')
         symbol = action.get('symbol')
@@ -666,6 +709,17 @@ class TradingRunner:
                     f"({(equity / p.starting_cash_usd - 1) * 100:+.2f}%) "
                     f"cash=${p.cash:.2f} free=${p.free_usd():.2f} "
                     f"open_cycles={len(self.tracker.cycles)}"
+                )
+            if self.short_account is not None:
+                r = self.short_account.record_equity(self.cached_balance)
+                self.logger.info(
+                    f"PAPER shorts open={r['open_shorts']} "
+                    f"notional=${r['notional']:.2f} ({r['notional_pct_of_total']:.1f}% of total) "
+                    f"margin=${r['margin_required']:.2f} unreal=${r['unrealized']:+.2f} "
+                    f"realized=${r['gross_realized']:+.2f} fees=${r['fees_paid']:.2f} "
+                    f"funding=${r['funding_received']:+.2f} closed={r['closed_count']} "
+                    f"short_equity=${r['short_equity']:+.2f} "
+                    f"TOTAL=${r['total_equity']:.2f}"
                 )
         except Exception as e:
             self.logger.error(f"Balance refresh failed: {e}")

@@ -568,6 +568,17 @@ class StartupReconciler:
                 continue
 
             sym = o.get("symbol")
+            # Only buys that actually executed are positions. A closed buy
+            # with filled == 0 is a canceled rung: adopting it as filled
+            # created phantom holdings (the old `filled or amount` fallback).
+            if o["filled"] is None:
+                self.logger.error(
+                    f"Closed buy {oid} {sym} has no 'filled' value; not adopted"
+                )
+                continue
+            filled = float(o["filled"])
+            if filled <= 0:
+                continue
             status = self._normalize_status(o.get("status"))
             ts = o.get("datetime") or datetime.now(timezone.utc).isoformat()
             amt = float(o.get("amount") or 0.0)
@@ -583,12 +594,10 @@ class StartupReconciler:
                     timestamp=ts,
                     status=status,
                 )
-                filled = float(o.get("filled") or amt)
-                if filled > 0:
-                    fee = o.get("fee") or {}
-                    fcost = float(fee.get("cost") or 0.0) if isinstance(fee, dict) else 0.0
-                    self.tracker.append_fill(oid, "buy", px, filled, fcost, ts)
-                self.logger.info(f"Adopted orphan closed buy {oid} {sym} status={status}")
+                fee = o.get("fee") or {}
+                fcost = float(fee.get("cost") or 0.0) if isinstance(fee, dict) else 0.0
+                self.tracker.append_fill(oid, "buy", px, filled, fcost, ts)
+                self.logger.info(f"Adopted orphan closed buy {oid} {sym} status={status} filled={filled}")
             except Exception as e:
                 self.logger.error(f"Adopt closed buy {oid} failed: {e}")
                 continue
@@ -600,6 +609,9 @@ class StartupReconciler:
             for soid, so in closed_by_id.items():
                 if so.get("side") != "sell" or so.get("symbol") != sym:
                     continue
+                # A sell that executed nothing can't complete a cycle.
+                if so["filled"] is None or float(so["filled"]) <= 0:
+                    continue
                 scl = so.get("clientOrderId") or ""
                 if scl.startswith("a-") or (scl.startswith("s-") and abs(float(so.get("filled") or 0) - buy_filled) / max(buy_filled, 1e-9) < 0.01):
                     found = (soid, so)
@@ -608,7 +620,7 @@ class StartupReconciler:
                 soid, so = found
                 sstatus = self._normalize_status(so.get("status"))
                 sprice = float(so.get("average") or so.get("price") or 0.0)
-                samt = float(so.get("filled") or so.get("amount") or buy_filled)
+                samt = float(so["filled"])
                 sts = so.get("datetime") or ts
                 try:
                     self.tracker.add_sell(oid, soid, so.get("clientOrderId") or "", so.get("type") or "market", samt, sprice, sts, sstatus)

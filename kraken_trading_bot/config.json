@@ -8,7 +8,6 @@
     "AVAX/USD",
     "SOL/USD",
     "LINK/USD",
-    "CC/USD",
     "ETH/USD",
     "HBAR/USD",
     "XLM/USD",
@@ -54,6 +53,20 @@
     "refresh_interval_seconds": 3600,
     "max_staleness_hours": 26,
     "buy_gate_cancel_retry_seconds": 60
+  },
+  "short_grid": {
+    "enabled": true,
+    "gate": "below_short_sma",
+    "spacing_pct": 1.0,
+    "size_pct": 0.5,
+    "cap_pct": 30.0,
+    "stop_pct": 3.0,
+    "trail_activate_pct": 5.0,
+    "trail_pct": 8.0,
+    "trail_floor_pct": 0.5,
+    "taker_fee_pct": 0.05,
+    "entry_interval_seconds": 60,
+    "max_perp_book_age_seconds": 30
   },
   "perps": {
     "products": {
@@ -113,6 +126,7 @@
       "OrderBookBuffer": "WARNING",
       "OrderOperations": "INFO",
       "PaperExchange": "INFO",
+      "PaperFutures": "INFO",
       "PerpMarketData": "INFO",
       "PerpStatus": "INFO",
       "PrivateMessageSorter": "WARNING",
@@ -122,6 +136,7 @@
       "RawWsLogger": "WARNING",
       "RegimeClassifier": "WARNING",
       "RulesTradingBot": "INFO",
+      "ShortGrid": "INFO",
       "ShutdownManager": "WARNING",
       "StartupReconciler": "INFO",
       "TickerBuffer": "WARNING",
@@ -138,7 +153,6 @@
         "AVAX/USD",
         "SOL/USD",
         "LINK/USD",
-        "CC/USD",
         "ETH/USD",
         "HBAR/USD",
         "XLM/USD",

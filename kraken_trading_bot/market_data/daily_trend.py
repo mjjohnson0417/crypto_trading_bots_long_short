@@ -130,3 +130,31 @@ class DailyTrendGate:
             f"close {s['close']:.6g} on {s['day']:%Y-%m-%d} at/above "
             f"sma{self.buy_gate_sma_days} {s['sma_buy']:.6g}"
         )
+
+    SHORT_GATE_MODES = ('below_short_sma', 'below_either_sma')
+
+    def short_gate(self, symbol: str, now: datetime, mode: str):
+        """Return (allowed: bool, reason: str) for opening new shorts.
+
+        mode 'below_short_sma':  previous close < its short-gate SMA (50d).
+        mode 'below_either_sma': previous close < the 50d OR the 200d SMA.
+        Stale daily data blocks new shorts, the same as buy_gate()."""
+        if mode not in self.SHORT_GATE_MODES:
+            raise ValueError(f"short gate mode {mode!r} not in {self.SHORT_GATE_MODES}")
+        s = self.status[symbol]
+        age_hours = (now - (s['day'] + _ONE_DAY)).total_seconds() / 3600.0
+        if age_hours > self.max_staleness_hours:
+            return False, (
+                f"daily data stale: last completed day {s['day']:%Y-%m-%d} "
+                f"is {age_hours:.1f}h old (> {self.max_staleness_hours}h)"
+            )
+        below_short = s['close'] < s['sma_short']
+        below_buy = s['close'] < s['sma_buy']
+        allowed = below_short or (mode == 'below_either_sma' and below_buy)
+        return allowed, (
+            f"close {s['close']:.6g} on {s['day']:%Y-%m-%d}, "
+            f"sma{self.short_gate_sma_days} {s['sma_short']:.6g} "
+            f"({'below' if below_short else 'at/above'}), "
+            f"sma{self.buy_gate_sma_days} {s['sma_buy']:.6g} "
+            f"({'below' if below_buy else 'at/above'}), gate={mode}"
+        )

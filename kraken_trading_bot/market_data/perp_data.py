@@ -52,6 +52,9 @@ class PerpMarketData:
         self.ticker = {p: None for p in self.products}
         self.trades = {p: deque(maxlen=self.trade_buffer_maxlen) for p in self.products}
         self.books = {p: _Book() for p in self.products}
+        # {product_id: instrument} from Kraken Futures, set by
+        # validate_instruments() at startup (contract precision, margin tiers).
+        self.instruments = None
         # Set by apply() when a book needs a fresh snapshot; the WS layer
         # reconnects and clears it.
         self.resync_needed = False
@@ -73,6 +76,7 @@ class PerpMarketData:
                     f"perps: {product} ({spot}) is not a perpetual "
                     f"(type={ins['type']!r})"
                 )
+        self.instruments = {p: instruments[p] for p in self.products}
         self.logger.info(f"Perp products validated: {self.spot_to_product}")
 
     # ── Message intake ──────────────────────────────────────────────────
