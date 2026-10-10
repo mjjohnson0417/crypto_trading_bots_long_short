@@ -27,7 +27,7 @@
     "hysteresis_seconds": 90,
     "ladder": {
       "rung_count": 5,
-      "spacing_pct": 1.0,
+      "spacing_pct": 1.5,
       "proximity_pct": 1.0
     },
     "chase": {
@@ -37,9 +37,17 @@
       "spacing_pct": 0.6
     },
     "ladder_defaults": {
-      "position_size_pct": 0.0886,
-      "profit_pct": 2.0
+      "position_size_pct": 0.25,
+      "profit_pct": 3.0
     }
+  },
+  "daily_trend": {
+    "buy_gate_sma_days": 200,
+    "short_gate_sma_days": 50,
+    "fetch_limit": 720,
+    "refresh_interval_seconds": 3600,
+    "max_staleness_hours": 26,
+    "buy_gate_cancel_retry_seconds": 60
   },
   "market_data": {
     "kline_seed_interval": "15m",
@@ -63,6 +71,7 @@
     "level": "INFO",
     "console_logging": true,
     "module_levels": {
+      "DailyTrendGate": "INFO",
       "DataManager": "WARNING",
       "ExchangeConnection": "WARNING",
       "ExchangeSync": "INFO",

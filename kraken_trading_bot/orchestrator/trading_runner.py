@@ -24,6 +24,7 @@ from exchange.fee_cache import FeeCache
 from exchange.order_operations import OrderOperations
 from indicators import IndicatorCalculator
 from logging_config import get_logger
+from market_data.daily_trend import DailyTrendGate
 from persistence.trade_tracker import TradeTracker
 from price_calculator import calculate_portfolio_value
 from strategy.hybrid_grid import HybridGridStrategy
@@ -67,6 +68,12 @@ class TradingRunner:
             config=config,
             fee_cache=self.fee_cache,
             data_manager=data_manager,
+        )
+        # 200-day buy gate. main.py awaits daily_trend.initialize() before
+        # the runner starts, so the bot never trades without it.
+        self.daily_trend = DailyTrendGate(
+            self.symbols, exchange_connection.rest_exchange,
+            config['daily_trend'],
         )
 
         # Runtime state.
@@ -129,6 +136,7 @@ class TradingRunner:
             asyncio.create_task(self._executions_consumer(), name='executions_consumer'),
             asyncio.create_task(self._tick_loop(), name='tick_loop'),
             asyncio.create_task(self._balance_refresh_loop(), name='balance_refresh'),
+            asyncio.create_task(self._daily_trend_refresh_loop(), name='daily_trend_refresh'),
         ]
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -438,6 +446,8 @@ class TradingRunner:
             symbol, trades_df, ticker_data,
         )
 
+        buys_allowed, buy_gate_reason = self.daily_trend.buy_gate(symbol, now)
+
         actions = self.strategy.evaluate(
             symbol=symbol,
             indicators=indicators,
@@ -445,6 +455,8 @@ class TradingRunner:
             orders=self.tracker.cycles,
             cached_balance=self.cached_balance,
             now=now,
+            buys_allowed=buys_allowed,
+            buy_gate_reason=buy_gate_reason,
         )
         for action in actions:
             try:
@@ -562,6 +574,16 @@ class TradingRunner:
             if self.shutdown_event.is_set():
                 return
             await self._refresh_balance()
+
+    async def _daily_trend_refresh_loop(self) -> None:
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.daily_trend.refresh_interval_seconds)
+            except asyncio.CancelledError:
+                return
+            if self.shutdown_event.is_set():
+                return
+            await self.daily_trend.refresh()
 
     async def _refresh_balance(self) -> None:
         try:

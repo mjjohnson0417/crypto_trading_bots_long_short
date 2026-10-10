@@ -2,7 +2,10 @@
 
 The runner constructs once with `symbols`, `config`, `fee_cache`,
 `data_manager`. Then calls `evaluate(symbol, indicators, mid_price,
-orders, cached_balance, now)` per tick. Returns a list of plain-dict
+orders, cached_balance, now, buys_allowed, buy_gate_reason)` per tick.
+`buys_allowed` comes from the daily-trend gate (200-day SMA): while it is
+False, no new buys are placed, resting buys are canceled, and exits
+still run. Returns a list of plain-dict
 actions for the runner to dispatch against `order_ops`.
 
 Action dicts:
@@ -50,6 +53,12 @@ class _LadderState:
         self.last_confirmed_state: Optional[str] = None
 
 
+class _BuyGateState:
+    def __init__(self):
+        self.allowed: Optional[bool] = None
+        self.last_cancel_sweep = None
+
+
 class HybridGridStrategy:
 
     def __init__(self, symbols, config, fee_cache, data_manager):
@@ -73,6 +82,9 @@ class HybridGridStrategy:
         self.chase_spacing_pct = float(h_chase['spacing_pct'])
         self.ladder_position_size_pct = float(h_ladder_defaults['position_size_pct'])
         self.ladder_profit_pct = float(h_ladder_defaults['profit_pct'])
+        self.buy_gate_cancel_retry_seconds = float(
+            config['daily_trend']['buy_gate_cancel_retry_seconds']
+        )
 
         if not self.chase_enabled:
             self.logger.info(
@@ -86,22 +98,33 @@ class HybridGridStrategy:
         }
         self.chase = {s: _ChaseState() for s in self.symbols}
         self.ladder = {s: _LadderState() for s in self.symbols}
+        self.buy_gate = {s: _BuyGateState() for s in self.symbols}
 
     # ── Public entry point ───────────────────────────────────────────────
 
-    def evaluate(self, symbol, indicators, mid_price, orders, cached_balance, now) -> List[dict]:
+    def evaluate(self, symbol, indicators, mid_price, orders, cached_balance, now,
+                 buys_allowed, buy_gate_reason) -> List[dict]:
         actions: List[dict] = []
         state = self.classifiers[symbol].update(indicators, now)
 
         actions.extend(self._handle_state_transitions(symbol, state, mid_price, orders))
 
-        if state == STATE_STRONG_UPTREND:
-            if self.chase_enabled:
-                actions.extend(self._chase_decisions(symbol, mid_price, orders, cached_balance))
+        if not buys_allowed:
+            # Daily-trend gate: no new buys; cancel resting ones (skip any
+            # the state transition above already canceled this tick).
+            already = {a['order_id'] for a in actions if a['action'] == 'cancel_order'}
+            for a in self._buy_gate_paused(symbol, buy_gate_reason, orders, now):
+                if a['order_id'] not in already:
+                    actions.append(a)
         else:
-            actions.extend(
-                self._ladder_decisions(symbol, mid_price, orders, cached_balance)
-            )
+            self._buy_gate_allowed(symbol, buy_gate_reason)
+            if state == STATE_STRONG_UPTREND:
+                if self.chase_enabled:
+                    actions.extend(self._chase_decisions(symbol, mid_price, orders, cached_balance))
+            else:
+                actions.extend(
+                    self._ladder_decisions(symbol, mid_price, orders, cached_balance)
+                )
 
         actions.extend(self._exit_decisions(symbol, mid_price, orders))
         return actions
@@ -193,6 +216,44 @@ class HybridGridStrategy:
 
         ladder.last_confirmed_state = state
         return actions
+
+    # ── Daily-trend buy gate ────────────────────────────────────────────
+
+    def _buy_gate_paused(self, symbol, reason, orders, now) -> List[dict]:
+        """Buys are paused: cancel every resting buy for the symbol on
+        the flip, and re-sweep every buy_gate_cancel_retry_seconds in
+        case a cancel did not take. The ladder's last adjust price is
+        cleared so it rebuilds from the current mid when buys resume."""
+        gate = self.buy_gate[symbol]
+        flipped = gate.allowed is not False
+        if flipped:
+            self.logger.warning(f"{symbol} buys PAUSED — {reason}")
+        gate.allowed = False
+        self.ladder[symbol].last_adjust_price = None
+
+        if (not flipped and gate.last_cancel_sweep is not None
+                and (now - gate.last_cancel_sweep).total_seconds()
+                < self.buy_gate_cancel_retry_seconds):
+            return []
+        gate.last_cancel_sweep = now
+
+        actions: List[dict] = []
+        for rule in ('ladder', 'chase'):
+            for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, rule):
+                actions.append({"action": "cancel_order",
+                                "symbol": symbol, "order_id": buy_oid})
+        if actions:
+            self.logger.info(
+                f"{symbol} buy gate canceling {len(actions)} resting buy(s)"
+            )
+        return actions
+
+    def _buy_gate_allowed(self, symbol, reason) -> None:
+        gate = self.buy_gate[symbol]
+        if gate.allowed is not True:
+            self.logger.info(f"{symbol} buys ALLOWED — {reason}")
+        gate.allowed = True
+        gate.last_cancel_sweep = None
 
     # ── Chase decisions ─────────────────────────────────────────────────
 

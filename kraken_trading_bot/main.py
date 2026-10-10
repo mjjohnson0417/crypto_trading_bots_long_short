@@ -80,6 +80,10 @@ async def main():
             shutdown_event=shutdown_event,
         )
 
+        # Daily candles + SMAs for the 200-day buy gate. Raises (and the
+        # bot exits) if any symbol can't be fetched or lacks history.
+        await runner.daily_trend.initialize()
+
         # Boot-time reconciliation MUST run before the runner task (and thus
         # before _tick_loop or executions_consumer can act on tracker state).
         reconciler = StartupReconciler(
