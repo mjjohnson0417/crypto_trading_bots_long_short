@@ -446,7 +446,7 @@ class HybridGridStrategy:
     def _ladder_exits(self, symbol, mid_price, orders) -> List[dict]:
         # Aggregate across all filled ladder buys for the symbol that
         # haven't been sold yet. Compute weighted avg cost. If
-        # mid_price ≥ avg * (1 + fees + profit_pct), emit one market sell
+        # mid_price ≥ avg * (1 + buy fee + taker fee + profit_pct), emit one market sell
         # for the total qty.
         total_qty = 0.0
         total_value = 0.0
@@ -470,12 +470,14 @@ class HybridGridStrategy:
         if total_qty <= 0:
             return []
         avg_cost = total_value / total_qty
-        maker_fee = self.fee_cache.maker(symbol)
+        # The aggregate exit is a market sell, so the sell side pays the
+        # taker rate (current volume tier from FeeCache).
+        taker_fee = self.fee_cache.taker(symbol)
         # Target: cover round-trip fees + intended profit, against the
         # weighted average buy cost.
         target_price = calculate_tp_price(
             avg_cost, total_buy_fee, total_qty,
-            maker_fee, self.ladder_profit_pct, 0,
+            taker_fee, self.ladder_profit_pct, 0,
         )
         if mid_price < target_price:
             return []

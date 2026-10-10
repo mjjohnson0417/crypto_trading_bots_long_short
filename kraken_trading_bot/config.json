@@ -20,6 +20,7 @@
     "max_book_age_seconds": 10,
     "tick_interval_seconds": 1,
     "balance_refresh_interval_seconds": 60,
+    "fee_refresh_interval_seconds": 3600,
     "order_send_timeout_seconds": 10.0,
     "exchange_sync_lookback_seconds": 1800
   },
@@ -80,7 +81,7 @@
       "DataManager": "WARNING",
       "ExchangeConnection": "WARNING",
       "ExchangeSync": "INFO",
-      "FeeCache": "WARNING",
+      "FeeCache": "INFO",
       "HybridGridStrategy": "INFO",
       "IndicatorCalculator": "WARNING",
       "KeyLoader": "WARNING",

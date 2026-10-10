@@ -54,6 +54,9 @@ class TradingRunner:
         self.order_send_timeout_seconds = float(
             trading_cfg['order_send_timeout_seconds']
         )
+        self.fee_refresh_interval_seconds = float(
+            trading_cfg['fee_refresh_interval_seconds']
+        )
 
         # Built objects. In dry run, orders go to a PaperExchange and the
         # tracker persists under paper_trading/ so paper and live state
@@ -160,6 +163,7 @@ class TradingRunner:
             asyncio.create_task(self._tick_loop(), name='tick_loop'),
             asyncio.create_task(self._balance_refresh_loop(), name='balance_refresh'),
             asyncio.create_task(self._daily_trend_refresh_loop(), name='daily_trend_refresh'),
+            asyncio.create_task(self._fee_refresh_loop(), name='fee_refresh'),
         ]
         if self.paper_exchange is not None:
             tasks.append(asyncio.create_task(
@@ -628,6 +632,16 @@ class TradingRunner:
             if self.shutdown_event.is_set():
                 return
             await self._refresh_balance()
+
+    async def _fee_refresh_loop(self) -> None:
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.fee_refresh_interval_seconds)
+            except asyncio.CancelledError:
+                return
+            if self.shutdown_event.is_set():
+                return
+            await self.fee_cache.refresh()
 
     async def _daily_trend_refresh_loop(self) -> None:
         while not self.shutdown_event.is_set():
