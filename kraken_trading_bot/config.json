@@ -23,6 +23,11 @@
     "order_send_timeout_seconds": 10.0,
     "exchange_sync_lookback_seconds": 1800
   },
+  "paper_trading": {
+    "starting_cash_usd": 10000.0,
+    "fill_check_interval_seconds": 0.5,
+    "closed_order_retention_hours": 48
+  },
   "hybrid_grid": {
     "hysteresis_seconds": 90,
     "ladder": {
@@ -82,6 +87,7 @@
       "KlineBuffer": "WARNING",
       "OrderBookBuffer": "WARNING",
       "OrderOperations": "INFO",
+      "PaperExchange": "INFO",
       "PrivateMessageSorter": "WARNING",
       "PrivateWebSocket": "WARNING",
       "PublicMessageSorter": "WARNING",

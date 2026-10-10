@@ -8,6 +8,7 @@ No state tracking. No price calculations. No reconciliation.
 import math
 from typing import Optional
 
+from exchange.paper_exchange import PaperOrderError
 from logging_config import get_logger
 
 logger = get_logger('OrderOperations')
@@ -37,7 +38,8 @@ class OrderOperations:
         'Order minimum not met',
     )
 
-    def __init__(self, exchange_connection, data_manager, dry_run, send_timeout_seconds):
+    def __init__(self, exchange_connection, data_manager, dry_run, send_timeout_seconds,
+                 paper_exchange):
         """
         Args:
             exchange_connection: ExchangeConnection instance (provides rest_exchange).
@@ -48,13 +50,43 @@ class OrderOperations:
                 read methods are unaffected.
             send_timeout_seconds: How long to wait for Kraken's WS ack on
                 each place/cancel. Required — no default.
+            paper_exchange: PaperExchange when dry_run is True (required),
+                None when live (required). In dry run every placement,
+                cancel, order query and balance query goes to the paper
+                account; market prices still come from Kraken.
         """
         self.exchange = exchange_connection
         self.dm = data_manager
         self.dry_run = bool(dry_run)
         self.send_timeout = float(send_timeout_seconds)
+        if self.dry_run and paper_exchange is None:
+            raise ValueError("dry_run requires a PaperExchange")
+        if not self.dry_run and paper_exchange is not None:
+            raise ValueError("PaperExchange given but dry_run is off")
+        self.paper = paper_exchange
         if self.dry_run:
-            logger.warning("OrderOperations DRY_RUN active — placements and cancels will be stubbed")
+            logger.warning("OrderOperations DRY_RUN active — orders go to the PAPER account, not Kraken")
+
+    def _paper_place(self, symbol, side, ord_type, quantity, price, cl_ord_id):
+        """Dry-run placement with the same rounding and error contract as
+        the live WS path: buys log and return None on rejection; sells
+        raise InsufficientFundsError / OrderRejectedError."""
+        qty = self._format_qty(quantity, symbol)
+        px = self._format_price(price, symbol) if ord_type == 'limit' else None
+        try:
+            order_id = self.paper.place(symbol, side, ord_type, qty, px, cl_ord_id)
+        except PaperOrderError as e:
+            error = str(e)
+            logger.error(f"[PAPER] {ord_type} {side} failed {symbol}: {error}")
+            if side == 'sell':
+                if 'Insufficient funds' in error:
+                    raise InsufficientFundsError(f"{symbol}: {error}")
+                if self._is_permanent_rejection(error):
+                    raise OrderRejectedError(f"{symbol}: {error}")
+            return None
+        where = f" @ ${px:.6f}" if px is not None else ""
+        logger.info(f"[PAPER] {ord_type} {side} placed: {order_id} {symbol} qty={qty:.6f}{where} cl_ord_id={cl_ord_id}")
+        return order_id
 
     def _ws_available(self):
         return self.dm is not None and self.dm.private_ws.is_connected()
@@ -98,8 +130,7 @@ class OrderOperations:
     async def place_limit_buy(self, symbol: str, quantity: float, price: float, cl_ord_id: Optional[str] = None):
         """Place a limit buy via WebSocket. Returns order_id or None."""
         if self.dry_run:
-            logger.info(f"[DRY_RUN] limit buy {symbol} qty={quantity:.6f} @ ${price:.6f} cl_ord_id={cl_ord_id}")
-            return None
+            return self._paper_place(symbol, 'buy', 'limit', quantity, price, cl_ord_id)
         if self._ws_available():
             params = {
                 "order_type": "limit",
@@ -130,8 +161,7 @@ class OrderOperations:
         Raises InsufficientFundsError or OrderRejectedError on permanent failures.
         """
         if self.dry_run:
-            logger.info(f"[DRY_RUN] limit sell {symbol} qty={quantity:.6f} @ ${price:.6f} cl_ord_id={cl_ord_id}")
-            return None
+            return self._paper_place(symbol, 'sell', 'limit', quantity, price, cl_ord_id)
         if self._ws_available():
             params = {
                 "order_type": "limit",
@@ -164,8 +194,7 @@ class OrderOperations:
     async def place_market_buy(self, symbol: str, quantity: float, cl_ord_id: Optional[str] = None):
         """Place a market buy via WebSocket. Returns order_id or None."""
         if self.dry_run:
-            logger.info(f"[DRY_RUN] market buy {symbol} qty={quantity:.6f} cl_ord_id={cl_ord_id}")
-            return None
+            return self._paper_place(symbol, 'buy', 'market', quantity, None, cl_ord_id)
         if self._ws_available():
             params = {
                 "order_type": "market",
@@ -196,8 +225,7 @@ class OrderOperations:
         (consistent with place_limit_sell).
         """
         if self.dry_run:
-            logger.info(f"[DRY_RUN] market sell {symbol} qty={quantity:.6f} cl_ord_id={cl_ord_id}")
-            return None
+            return self._paper_place(symbol, 'sell', 'market', quantity, None, cl_ord_id)
         if self._ws_available():
             params = {
                 "order_type": "market",
@@ -237,8 +265,9 @@ class OrderOperations:
             'error'   — any other failure.
         """
         if self.dry_run:
-            logger.info(f"[DRY_RUN] cancel {order_id} {symbol}")
-            return 'success'
+            result = self.paper.cancel(order_id)
+            logger.info(f"[PAPER] cancel {order_id} {symbol}: {result}")
+            return result
         if self._ws_available():
             response = await self.dm.private_ws.send_order({
                 "method": "cancel_order",
@@ -263,16 +292,23 @@ class OrderOperations:
 
     async def fetch_open_orders(self, symbol: str = None):
         """Fetch open orders (REST). symbol=None → all open orders account-wide."""
+        if self.dry_run:
+            return self.paper.fetch_open_orders(symbol)
         return await self.exchange.rest_exchange.fetch_open_orders(symbol)
 
     async def fetch_closed_orders(self, since_timestamp: float = None):
         """Fetch closed orders (REST). since_timestamp in ms."""
+        if self.dry_run:
+            return self.paper.fetch_closed_orders(since_timestamp)
         return await self.exchange.rest_exchange.fetch_closed_orders(
             since=int(since_timestamp) if since_timestamp else None)
 
     async def fetch_all_balances(self) -> dict:
         """Fetch all currency balances in one REST call. Returns {currency: total}."""
-        balance = await self.exchange.rest_exchange.fetch_balance()
+        if self.dry_run:
+            balance = self.paper.balances()
+        else:
+            balance = await self.exchange.rest_exchange.fetch_balance()
         totals = balance['total']
         return {k: float(v) for k, v in totals.items() if v and float(v) > 0}
 
@@ -297,6 +333,8 @@ class OrderOperations:
         """Full ccxt balance response (includes 'free', 'used', 'total' per currency at top level).
         Exchange is the source of truth for holdings.
         """
+        if self.dry_run:
+            return self.paper.balances()
         balance = await self.exchange.rest_exchange.fetch_balance()
         return balance or {}
 

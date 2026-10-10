@@ -119,7 +119,23 @@ async def main():
         sync_task = asyncio.create_task(sync.run(), name='exchange_sync')
 
         logger.info("Trading stack up — waiting for shutdown signal.")
-        await shutdown_event.wait()
+        # Wait for a shutdown signal OR for a long-lived task to end. Either
+        # task ending on its own is a failure: run the normal cancel-and-
+        # shutdown sequence, then exit non-zero so systemd restarts the bot.
+        shutdown_wait = asyncio.create_task(shutdown_event.wait(), name='shutdown_wait')
+        done, _ = await asyncio.wait(
+            {shutdown_wait, trading_task, sync_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_wait not in done:
+            for t in done:
+                exc = None if t.cancelled() else t.exception()
+                logger.error(
+                    f"Task {t.get_name()} stopped unexpectedly "
+                    f"(exception={exc!r}) — shutting down for restart"
+                )
+            await shutdown_mgr.cancel_and_shutdown()
+            raise RuntimeError("long-lived task stopped unexpectedly")
         logger.info("Shutdown signal received.")
 
         # Cancel long-lived tasks (sync first is fine; both are independent).

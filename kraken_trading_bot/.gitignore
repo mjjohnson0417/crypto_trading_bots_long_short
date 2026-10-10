@@ -19,3 +19,6 @@ historical_data/
 *.gpg
 *.key
 .env
+
+# Paper-trading account and tracker (dry run)
+paper_trading/

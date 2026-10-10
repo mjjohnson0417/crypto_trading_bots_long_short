@@ -1,0 +1,32 @@
+[Unit]
+Description=Kraken Long/Short Trading Bot (v3 copy — dry_run = paper trading)
+Wants=network-online.target
+After=network-online.target
+# Raw WS recordings go to the external SSD; don't start without it.
+RequiresMountsFor=/mnt/externalssd
+# Never stop retrying: no start-rate limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=jason
+
+WorkingDirectory=/home/jason/crypto_trading_bots_v3/kraken_trading_bot
+
+# Age-encrypted GPG passphrase configuration (see credentials/key_loader.py)
+Environment=TRADING_PASSPHRASE_AGE_FILE=/etc/kraken/trading_passphrase.age
+Environment=AGE_IDENTITY_FILE=/home/jason/.age/key.txt
+
+ExecStart=/home/jason/crypto_trading_bots_v3/kraken_trading_bot/start_rules_trading_bot.sh
+
+# Restart on crash, non-zero exit, or the WS watchdog's exit.
+Restart=on-failure
+RestartSec=30
+# Time for the shutdown sequence (cancel open buys, close WS + REST).
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kraken_long_short_bot
+
+[Install]
+WantedBy=multi-user.target

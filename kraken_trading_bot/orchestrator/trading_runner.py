@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 from exchange.fee_cache import FeeCache
 from exchange.order_operations import OrderOperations
+from exchange.paper_exchange import PaperExchange
 from indicators import IndicatorCalculator
 from logging_config import get_logger
 from market_data.daily_trend import DailyTrendGate
@@ -54,14 +55,36 @@ class TradingRunner:
             trading_cfg['order_send_timeout_seconds']
         )
 
-        # Built objects.
+        # Built objects. In dry run, orders go to a PaperExchange and the
+        # tracker persists under paper_trading/ so paper and live state
+        # never mix.
+        self.fee_cache = FeeCache(exchange_connection)
+        if self.dry_run:
+            self.paper_exchange = PaperExchange(
+                symbols=self.symbols,
+                data_manager=data_manager,
+                fee_cache=self.fee_cache,
+                markets_source=exchange_connection.rest_exchange,
+                config=config['paper_trading'],
+                state_dir='paper_trading',
+            )
+            closed_lookback = float(trading_cfg['exchange_sync_lookback_seconds'])
+            if self.paper_exchange.closed_order_retention_hours * 3600 < closed_lookback:
+                raise ValueError(
+                    "paper_trading.closed_order_retention_hours must cover "
+                    "trading.exchange_sync_lookback_seconds"
+                )
+            tracker_dir = 'paper_trading'
+        else:
+            self.paper_exchange = None
+            tracker_dir = 'live_trading'
         self.order_ops = OrderOperations(
             exchange_connection, data_manager,
             dry_run=self.dry_run,
             send_timeout_seconds=self.order_send_timeout_seconds,
+            paper_exchange=self.paper_exchange,
         )
-        self.fee_cache = FeeCache(exchange_connection)
-        self.tracker = TradeTracker()
+        self.tracker = TradeTracker(state_dir=tracker_dir)
         self.indicator_calculator = IndicatorCalculator(self.symbols)
         self.strategy = HybridGridStrategy(
             symbols=self.symbols,
@@ -138,6 +161,10 @@ class TradingRunner:
             asyncio.create_task(self._balance_refresh_loop(), name='balance_refresh'),
             asyncio.create_task(self._daily_trend_refresh_loop(), name='daily_trend_refresh'),
         ]
+        if self.paper_exchange is not None:
+            tasks.append(asyncio.create_task(
+                self.paper_exchange.run(self.shutdown_event), name='paper_fills',
+            ))
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
@@ -288,12 +315,13 @@ class TradingRunner:
         prev_cum = self._cum_qty_seen[key] if key in self._cum_qty_seen else 0.0
         if cum_qty > prev_cum:
             delta_qty = cum_qty - prev_cum
+            price, fee = self._execution_price_and_fee(order)
             self.tracker.append_fill(
                 buy_order_id=cycle_key,
                 side=side,
-                price=float(order.get('avg_price') or 0.0),
+                price=price,
                 qty=delta_qty,
-                fee=float(order.get('fee') or 0.0),
+                fee=fee,
                 timestamp=timestamp,
             )
             self._cum_qty_seen[key] = cum_qty
@@ -350,8 +378,7 @@ class TradingRunner:
         prev_cum = self._cum_qty_seen[key] if key in self._cum_qty_seen else 0.0
         if cum_qty > prev_cum:
             delta_qty = cum_qty - prev_cum
-            avg_price = float(order.get('avg_price') or 0.0)
-            fee = float(order.get('fee') or 0.0)
+            avg_price, fee = self._execution_price_and_fee(order)
             buy_qtys = [
                 sum(float(f['qty']) for f in cycle['buy']['fills'])
                 for _buy_oid, cycle in covered
@@ -374,6 +401,33 @@ class TradingRunner:
         if status == 'filled':
             for buy_oid, _cycle in covered:
                 self.tracker.archive(buy_oid)
+
+    @staticmethod
+    def _execution_price_and_fee(order: dict):
+        """Price and USD fee of the execution that raised cum_qty.
+
+        Kraken WS v2 sends fills as exec_type 'trade' events carrying
+        `last_price` (this execution's price) and `fees` (this execution's
+        fees, [{asset, qty}]). There is no `fee` field. Raises if the
+        event that advanced cum_qty lacks them, or if a fee is charged in
+        a non-USD asset — the caller logs it and the fill is left for the
+        next trade event or the reconciler, never recorded with a guessed
+        fee. cum_qty_seen is not advanced on a raise.
+        """
+        if 'last_price' not in order or 'fees' not in order:
+            raise ValueError(
+                f"order {order['order_id']}: cum_qty advanced on exec_type="
+                f"{order['exec_type']!r} without last_price/fees; fill not recorded"
+            )
+        fee = 0.0
+        for f in order['fees']:
+            if f['asset'] != 'USD':
+                raise ValueError(
+                    f"order {order['order_id']}: fee charged in {f['asset']!r}, "
+                    f"expected USD; fill not recorded"
+                )
+            fee += float(f['qty'])
+        return float(order['last_price']), fee
 
     def _find_open_ladder_cycles(self, symbol: str) -> list:
         """Return [(buy_order_id, cycle), ...] for cycles where the buy is
@@ -590,5 +644,14 @@ class TradingRunner:
             balances = await self.order_ops.fetch_all_balances()
             usd_prices = await self.order_ops.fetch_all_usd_prices()
             self.cached_balance = calculate_portfolio_value(balances, usd_prices)
+            if self.paper_exchange is not None:
+                equity = self.paper_exchange.record_equity(usd_prices)
+                p = self.paper_exchange
+                self.logger.info(
+                    f"PAPER equity=${equity:.2f} "
+                    f"({(equity / p.starting_cash_usd - 1) * 100:+.2f}%) "
+                    f"cash=${p.cash:.2f} free=${p.free_usd():.2f} "
+                    f"open_cycles={len(self.tracker.cycles)}"
+                )
         except Exception as e:
             self.logger.error(f"Balance refresh failed: {e}")
