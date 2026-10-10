@@ -3,6 +3,8 @@
 Owns:
   - The four DataFrames per symbol (book, trades, ticker, klines).
   - The public + private WebSocket wrappers and their tasks.
+  - The Kraken Futures public WebSocket and the perp market data
+    (`dm.perps`: ticker / trades / book per PF_ product).
   - The two sorters (public / private).
   - The queues between sorters and containers.
   - The REST kline seed at boot.
@@ -12,11 +14,14 @@ Other modules consume `dm.book`, `dm.trades`, `dm.ticker`, `dm.klines`
 directly — those are the public interface.
 """
 import asyncio
+from datetime import datetime, timezone
 
 from exchange import ExchangeConnection, PrivateWebSocket, PublicWebSocket
+from exchange.futures_public_ws import FuturesPublicWebSocket, fetch_futures_instruments
 from logging_config import get_logger
 from market_data.klines import KlineBuffer
 from market_data.order_book import OrderBookBuffer
+from market_data.perp_data import PerpMarketData
 from market_data.private_sorter import PrivateMessageSorter
 from market_data.public_sorter import PublicMessageSorter
 from market_data.ticker import TickerBuffer
@@ -107,6 +112,27 @@ class DataManager:
             unhealthy_exit_seconds=self.ws_unhealthy_exit_seconds,
             health_max_age_seconds=self.public_ping_health_max_age_seconds,
         )
+        # Kraken Futures perps (public data only).
+        perps_cfg = config['perps']
+        self.perps = PerpMarketData(perps_cfg)
+        self.perp_status_log_interval_seconds = float(
+            perps_cfg['status_log_interval_seconds']
+        )
+        self.perp_instruments_timeout_seconds = float(
+            perps_cfg['instruments_timeout_seconds']
+        )
+        if raw_logger is None:
+            raise ValueError("DataManager requires the RawWsLogger for perp logging")
+        raw_logger.add_symbols(self.perps.products)
+        self.futures_ws = FuturesPublicWebSocket(
+            self.perps,
+            raw_logger=raw_logger,
+            raw_log_channels=perps_cfg['raw_log_channels'],
+            is_shutdown=lambda: self.shutdown,
+            health_check_interval_seconds=self.ws_health_check_interval_seconds,
+            unhealthy_exit_seconds=self.ws_unhealthy_exit_seconds,
+            health_max_age_seconds=float(perps_cfg['health_max_age_seconds']),
+        )
         self.private_ws = PrivateWebSocket(
             self.rest_exchange,
             sorter=self.private_sorter,
@@ -125,6 +151,9 @@ class DataManager:
 
         await self._seed_klines_via_rest()
         await self.private_ws.obtain_token()
+        # Fail loud if any configured perp is missing / not a perpetual.
+        instruments = await fetch_futures_instruments(self.perp_instruments_timeout_seconds)
+        self.perps.validate_instruments(instruments)
 
         spec = [
             (self.public_ws.run(), 'public_ws'),
@@ -137,6 +166,9 @@ class DataManager:
             (self.trades.consume(self.trade_queue), 'trade_consumer'),
             (self.ticker.consume(self.ticker_queue), 'ticker_consumer'),
             (self._dataframe_logger(), 'dataframe_logger'),
+            (self.futures_ws.run(), 'futures_ws'),
+            (self.futures_ws.health_watchdog(), 'futures_ws_health'),
+            (self._perp_status_logger(), 'perp_status_logger'),
         ]
         for coro, name in spec:
             t = asyncio.create_task(coro, name=name)
@@ -186,6 +218,42 @@ class DataManager:
                 self.logger.info(f"{symbol} trades:\n{self.trades.get(symbol)}")
                 self.logger.info(f"{symbol} ticker:\n{self.ticker.get(symbol)}")
                 self.logger.info(f"{symbol} klines:\n{self.klines.get(symbol)}")
+
+    async def _perp_status_logger(self) -> None:
+        """One line per perp every `perps.status_log_interval_seconds`:
+        mark vs spot mid (basis), funding, book depth, last trade age."""
+        log = get_logger('PerpStatus')
+        while not self.shutdown:
+            await asyncio.sleep(self.perp_status_log_interval_seconds)
+            now = datetime.now(timezone.utc)
+            for product in self.perps.products:
+                spot = self.perps.product_to_spot[product]
+                try:
+                    t = self.perps.latest_ticker(product)
+                    book = self.perps.books[product]
+                    trades = self.perps.trades[product]
+                    spot_ticker = self.ticker.get(spot)
+                    if spot_ticker.empty:
+                        raise RuntimeError(f"no spot ticker for {spot}")
+                    last = spot_ticker.iloc[-1]
+                    spot_mid = (float(last['bid']) + float(last['ask'])) / 2.0
+                    basis = (t['markPrice'] / spot_mid - 1) * 100
+                    # relative_funding_rate: fraction of notional per hour.
+                    fund_hr = t['relative_funding_rate'] * 100
+                    fund_ann = fund_hr * 24 * 365
+                    trade_age = (now - trades[-1]['time']).total_seconds() if trades else None
+                    log.info(
+                        f"[PERP] {product} ({spot}) mark={t['markPrice']:.6g} "
+                        f"spot_mid={spot_mid:.6g} basis={basis:+.3f}% "
+                        f"funding={fund_hr:+.5f}%/h ({fund_ann:+.1f}%/yr) "
+                        f"bid/ask={t['bid']}/{t['ask']} "
+                        f"book={'ok' if book.valid else 'INVALID'} "
+                        f"({len(book.bids)}b/{len(book.asks)}a) "
+                        f"oi={t['openInterest']} "
+                        f"last_trade_age={'none' if trade_age is None else f'{trade_age:.0f}s'}"
+                    )
+                except Exception as e:
+                    log.warning(f"[PERP] {product} ({spot}) status unavailable: {e}")
 
     # ── Shutdown ───────────────────────────────────────────────────────
 

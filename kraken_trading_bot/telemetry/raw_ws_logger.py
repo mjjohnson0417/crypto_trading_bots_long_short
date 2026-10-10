@@ -39,6 +39,10 @@ class RawWsLogger:
         if self.enabled:
             self.log_path.mkdir(parents=True, exist_ok=True)
 
+    def add_symbols(self, symbols) -> None:
+        """Allow additional symbols (e.g. perp product_ids) to be logged."""
+        self.log_symbols |= {s.upper() for s in symbols}
+
     def log(self, channel: str, symbol: str, msg_type: str,
             payload: dict, timestamp: Optional[datetime] = None) -> None:
         """Append one raw-message line.

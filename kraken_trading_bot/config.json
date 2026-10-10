@@ -55,6 +55,29 @@
     "max_staleness_hours": 26,
     "buy_gate_cancel_retry_seconds": 60
   },
+  "perps": {
+    "products": {
+      "ONDO/USD": "PF_ONDOUSD",
+      "SUI/USD": "PF_SUIUSD",
+      "HYPE/USD": "PF_HYPEUSD",
+      "AVAX/USD": "PF_AVAXUSD",
+      "SOL/USD": "PF_SOLUSD",
+      "LINK/USD": "PF_LINKUSD",
+      "ETH/USD": "PF_ETHUSD",
+      "HBAR/USD": "PF_HBARUSD",
+      "XLM/USD": "PF_XLMUSD",
+      "XRP/USD": "PF_XRPUSD"
+    },
+    "trade_buffer_maxlen": 5000,
+    "health_max_age_seconds": 30,
+    "instruments_timeout_seconds": 20,
+    "status_log_interval_seconds": 300,
+    "raw_log_channels": [
+      "perp_ticker",
+      "perp_trade",
+      "perp_book"
+    ]
+  },
   "market_data": {
     "kline_seed_interval": "15m",
     "kline_seed_lookback": 200,
@@ -82,6 +105,7 @@
       "ExchangeConnection": "WARNING",
       "ExchangeSync": "INFO",
       "FeeCache": "INFO",
+      "FuturesPublicWebSocket": "INFO",
       "HybridGridStrategy": "INFO",
       "IndicatorCalculator": "WARNING",
       "KeyLoader": "WARNING",
@@ -89,6 +113,8 @@
       "OrderBookBuffer": "WARNING",
       "OrderOperations": "INFO",
       "PaperExchange": "INFO",
+      "PerpMarketData": "INFO",
+      "PerpStatus": "INFO",
       "PrivateMessageSorter": "WARNING",
       "PrivateWebSocket": "WARNING",
       "PublicMessageSorter": "WARNING",
