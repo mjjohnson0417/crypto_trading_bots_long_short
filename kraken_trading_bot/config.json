@@ -15,7 +15,7 @@
     "XRP/USD"
   ],
   "trading": {
-    "dry_run": false,
+    "dry_run": true,
     "warmup_seconds": 30,
     "max_book_age_seconds": 10,
     "tick_interval_seconds": 1,
