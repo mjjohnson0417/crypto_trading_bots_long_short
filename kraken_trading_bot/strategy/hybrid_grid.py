@@ -1,7 +1,7 @@
 """HybridGridStrategy — single-class strategy module.
 
 The runner constructs once with `symbols`, `config`, `fee_cache`,
-`data_manager`. Then calls `evaluate(symbol, indicators, mid_price,
+`data_manager`, `journal`, `swing_targets`. Then calls `evaluate(symbol, indicators, mid_price,
 orders, cached_balance, now, buys_allowed, buy_gate_reason)` per tick.
 `buys_allowed` comes from the daily-trend gate (200-day SMA): while it is
 False, no new buys are placed, resting buys are canceled, and exits
@@ -62,8 +62,11 @@ class _BuyGateState:
 
 class HybridGridStrategy:
 
-    def __init__(self, symbols, config, fee_cache, data_manager, journal):
+    def __init__(self, symbols, config, fee_cache, data_manager, journal, swing_targets):
         self.logger = get_logger('HybridGridStrategy')
+        # Aggregate-exit target per token (market_data/swing_target.py):
+        # +2 % below the 50-day, else sized to the token's recent rallies.
+        self.swing_targets = swing_targets
         self.symbols = [s.upper() for s in symbols]
         self.fee_cache = fee_cache
         self.data_manager = data_manager
@@ -135,7 +138,7 @@ class HybridGridStrategy:
                     self._ladder_decisions(symbol, mid_price, orders, cached_balance)
                 )
 
-        actions.extend(self._exit_decisions(symbol, mid_price, orders))
+        actions.extend(self._exit_decisions(symbol, mid_price, orders, now))
         for a in actions:
             a['regime'] = state
         return actions
@@ -421,16 +424,17 @@ class HybridGridStrategy:
 
     # ── Exit decisions ──────────────────────────────────────────────────
 
-    def _exit_decisions(self, symbol, mid_price, orders) -> List[dict]:
+    def _exit_decisions(self, symbol, mid_price, orders, now) -> List[dict]:
         """Two paths:
            - Chase: each filled chase buy with no sell → its own limit TP.
            - Ladder: aggregate avg-cost across all filled ladder buys
              with no sell. If mid_price ≥ target, ONE market sell for
-             the total qty.
+             the total qty. The profit part of the target comes from
+             swing_targets.target() (not ladder_defaults.profit_pct).
         """
         actions: List[dict] = []
         actions.extend(self._chase_exits(symbol, mid_price, orders))
-        actions.extend(self._ladder_exits(symbol, mid_price, orders))
+        actions.extend(self._ladder_exits(symbol, mid_price, orders, now))
         return actions
 
     def _chase_exits(self, symbol, mid_price, orders) -> List[dict]:
@@ -468,11 +472,12 @@ class HybridGridStrategy:
                             "parent_buy_order_id": buy_oid, "reason": "chase_tp"})
         return actions
 
-    def _ladder_exits(self, symbol, mid_price, orders) -> List[dict]:
+    def _ladder_exits(self, symbol, mid_price, orders, now) -> List[dict]:
         # Aggregate across all filled ladder buys for the symbol that
         # haven't been sold yet. Compute weighted avg cost. If
-        # mid_price ≥ avg * (1 + buy fee + taker fee + profit_pct), emit one market sell
-        # for the total qty.
+        # mid_price ≥ avg * (1 + buy fee + taker fee + target), emit one market sell
+        # for the total qty. target = swing_targets.target(): +2 % below the
+        # 50-day SMA, else sized to the token's recent rallies.
         total_qty = 0.0
         total_value = 0.0
         total_buy_fee = 0.0
@@ -500,11 +505,12 @@ class HybridGridStrategy:
         # The aggregate exit is a market sell, so the sell side pays the
         # taker rate (current volume tier from FeeCache).
         taker_fee = self.fee_cache.taker(symbol)
+        profit_pct, target_rule, target_reason = self.swing_targets.target(symbol, now)
         # Target: cover round-trip fees + intended profit, against the
         # weighted average buy cost.
         target_price = calculate_tp_price(
             avg_cost, total_buy_fee, total_qty,
-            taker_fee, self.ladder_profit_pct, 0,
+            taker_fee, profit_pct, 0,
         )
         if mid_price < target_price:
             return []
@@ -513,7 +519,9 @@ class HybridGridStrategy:
                  "qty": total_qty, "cl_ord_id": cl_ord_id,
                  "reason": "aggregate_target", "avg_cost": avg_cost,
                  "target_price": target_price, "cycles": n_cycles,
-                 "buy_fees": total_buy_fee, "taker_fee_pct": taker_fee}]
+                 "buy_fees": total_buy_fee, "taker_fee_pct": taker_fee,
+                 "profit_pct": profit_pct, "target_rule": target_rule,
+                 "target_reason": target_reason}]
 
     @staticmethod
     def _encode_agg_sell_cl_ord_id() -> str:

@@ -27,6 +27,7 @@ from exchange.paper_futures import PaperFuturesAccount
 from indicators import IndicatorCalculator
 from logging_config import get_logger
 from market_data.daily_trend import DailyTrendGate
+from market_data.swing_target import SwingTargets
 from persistence.journal import TradeJournal
 from persistence.trade_tracker import TradeTracker
 from price_calculator import calculate_portfolio_value
@@ -94,18 +95,24 @@ class TradingRunner:
         # Append-only record of every decision and fill (never rotated).
         self.journal = TradeJournal(tracker_dir)
         self.indicator_calculator = IndicatorCalculator(self.symbols)
+        # 200-day buy gate. main.py awaits daily_trend.initialize() before
+        # the runner starts, so the bot never trades without it.
+        self.daily_trend = DailyTrendGate(
+            self.symbols, exchange_connection.rest_exchange,
+            config['daily_trend'],
+        )
+        # Aggregate-exit targets (main.py awaits swing_targets.initialize()).
+        self.swing_targets = SwingTargets(
+            self.symbols, exchange_connection.rest_exchange,
+            config['aggregate_target'], self.daily_trend, self.journal,
+        )
         self.strategy = HybridGridStrategy(
             symbols=self.symbols,
             config=config,
             fee_cache=self.fee_cache,
             data_manager=data_manager,
             journal=self.journal,
-        )
-        # 200-day buy gate. main.py awaits daily_trend.initialize() before
-        # the runner starts, so the bot never trades without it.
-        self.daily_trend = DailyTrendGate(
-            self.symbols, exchange_connection.rest_exchange,
-            config['daily_trend'],
+            swing_targets=self.swing_targets,
         )
 
         # Trailing short grid on perps. Paper only: there is no live
@@ -172,6 +179,7 @@ class TradingRunner:
         self.journal.write(
             'bot_start', dry_run=self.dry_run, symbols=self.symbols,
             hybrid_grid=self.config['hybrid_grid'], daily_trend=self.config['daily_trend'],
+            aggregate_target=self.config['aggregate_target'],
             short_grid=self.config['short_grid'],
         )
 
@@ -201,6 +209,7 @@ class TradingRunner:
             asyncio.create_task(self._tick_loop(), name='tick_loop'),
             asyncio.create_task(self._balance_refresh_loop(), name='balance_refresh'),
             asyncio.create_task(self._daily_trend_refresh_loop(), name='daily_trend_refresh'),
+            asyncio.create_task(self._swing_target_refresh_loop(), name='swing_target_refresh'),
             asyncio.create_task(self._fee_refresh_loop(), name='fee_refresh'),
         ]
         if self.paper_exchange is not None:
@@ -759,6 +768,16 @@ class TradingRunner:
             if self.shutdown_event.is_set():
                 return
             await self.daily_trend.refresh()
+
+    async def _swing_target_refresh_loop(self) -> None:
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.swing_targets.refresh_interval_seconds)
+            except asyncio.CancelledError:
+                return
+            if self.shutdown_event.is_set():
+                return
+            await self.swing_targets.refresh()
 
     async def _refresh_balance(self) -> None:
         try:

@@ -39,7 +39,18 @@ trend gate. Strategy: `strategy/hybrid_grid.py`, runner:
 - **Ladder:** 5 rungs, `spacing_pct` 1.5, `proximity_pct` 1.0, each rung
   `position_size_pct` 0.25% of portfolio. Ratchets with price.
 - **Exit:** one aggregate market sell per symbol when mid ≥ weighted avg
-  cost × (1 + buy fee% + **taker** fee% + `profit_pct` 3). No stop-losses.
+  cost × (1 + buy fee% + **taker** fee% + target%). No stop-losses. The target
+  comes from `market_data/swing_target.py` (SwingTargets, config `aggregate_target`,
+  added 2026-10-11 from strategy_lab `analysis/swing_targets_down.py`):
+  - previous daily close below the 50-day SMA → **+2%** (get back to cash on small rebounds)
+  - otherwise **clip(1.0 × median of the last 6 completed 2% rallies, 1%, 8%)**, from a
+    causal zigzag on the last 720 completed hourly candles (Kraken REST, refreshed hourly;
+    the zigzag is the lab's `causal_dc`)
+  - `warmup_pct` (3%) when fewer than 6 rallies exist, or when the hourly data is more
+    than 3h stale (logged as an error). Startup fails if hourly candles can't load.
+  - `ladder_defaults.profit_pct` (3) is now only encoded in ladder buy cl_ord_ids.
+  - Backtest (2022 – mid-2026, $50K, classic fee tiers): 267% vs 176% for fixed +3%,
+    worst drop −15.3% vs −17.6%; worse worst single-year drop (−22% vs −18%).
 - **200-day buy gate** (`market_data/daily_trend.py`, DailyTrendGate):
   - Rule: buys are paused while the previous completed UTC day's close is below its 200-day SMA.
   - While paused: resting buys are canceled (re-swept every 60s); exits still run.
@@ -97,7 +108,7 @@ Live mode uses `live_trading/` for the tracker. Paper and live state never mix.
 | `wss://ws.kraken.com/v2` | spot book (depth 100), trades, ticker | `exchange/public_ws.py` → `market_data/{order_book,trades,ticker}.py` |
 | `wss://ws-auth.kraken.com/v2` | order placement + executions | `exchange/private_ws.py` |
 | `wss://futures.kraken.com/ws/v1` | perp ticker (mark, index, funding, OI), trades, full book | `exchange/futures_public_ws.py` → `market_data/perp_data.py` (`dm.perps`) |
-| Kraken spot REST (ccxt) | 15m klines seed, 1d candles, fees, balances, prices, order queries | various |
+| Kraken spot REST (ccxt) | 15m klines seed, 1d candles, 1h candles (swing targets), fees, balances, prices, order queries | various |
 | Futures REST (public) | instrument list, validated at startup | `fetch_futures_instruments` |
 
 - **Perp mapping:** explicit in `perps.products`. CC/USD has no perp.
@@ -117,8 +128,10 @@ the text log, to reconstruct trades.
   (`build`, `refill`, `ratchet_up`, `excess_rung`, `enter_strong_uptrend`,
   `enter_downtrend`, `exit_downtrend`, `buy_gate_paused`, `aggregate_target`, chase
   reasons), `mid`, `regime`, `buys_allowed`, dispatch `error`. The aggregate sell
-  also has `avg_cost`, `target_price`, `cycles`, `buy_fees`, `taker_fee_pct`.
-- **State:** `regime_change`, `buy_gate`, `short_gate` (flips only), `bot_start` (settings).
+  also has `avg_cost`, `target_price`, `cycles`, `buy_fees`, `taker_fee_pct`,
+  `profit_pct`, `target_rule` (`swing` / `below_short_sma` / `warmup` / `stale`), `target_reason`.
+- **State:** `regime_change`, `buy_gate`, `short_gate` (flips only), `swing_target`
+  (when a token's target rule or value changes), `bot_start` (settings).
 - **Results:** `fill` (every fill, both sides), `ladder_closed` (realized P&L of each
   aggregate sell), `short_open` / `short_activated` / `short_cover` (with trigger mid,
   fill price, slippage, net P&L), `short_funding` (hourly).

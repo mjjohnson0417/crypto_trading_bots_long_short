@@ -54,6 +54,18 @@
     "max_staleness_hours": 26,
     "buy_gate_cancel_retry_seconds": 60
   },
+  "aggregate_target": {
+    "swing_theta_pct": 2.0,
+    "swing_rallies": 6,
+    "swing_alpha": 1.0,
+    "min_pct": 1.0,
+    "max_pct": 8.0,
+    "below_short_sma_pct": 2.0,
+    "warmup_pct": 3.0,
+    "hourly_fetch_limit": 720,
+    "refresh_interval_seconds": 3600,
+    "max_staleness_hours": 3
+  },
   "short_grid": {
     "enabled": true,
     "gate": "below_short_sma",
@@ -138,6 +150,7 @@
       "RulesTradingBot": "INFO",
       "ShortGrid": "INFO",
       "ShutdownManager": "WARNING",
+    "SwingTargets": "INFO",
       "StartupReconciler": "INFO",
       "TickerBuffer": "WARNING",
       "TradeBuffer": "WARNING",

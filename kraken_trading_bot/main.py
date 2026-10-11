@@ -83,6 +83,8 @@ async def main():
         # Daily candles + SMAs for the 200-day buy gate. Raises (and the
         # bot exits) if any symbol can't be fetched or lacks history.
         await runner.daily_trend.initialize()
+        # Hourly candles → aggregate-exit targets. Needs daily_trend (50-day state).
+        await runner.swing_targets.initialize()
 
         # Boot-time reconciliation MUST run before the runner task (and thus
         # before _tick_loop or executions_consumer can act on tracker state).
