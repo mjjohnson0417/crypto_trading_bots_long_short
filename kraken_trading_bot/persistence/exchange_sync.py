@@ -109,7 +109,10 @@ class ExchangeSyncTask:
         divergences = 0
 
         # 1. Walk every tracker cycle and catch up anything the exchange
-        #    says is further along (closed while we were offline).
+        #    says is further along (closed while we were offline). Fills are
+        #    caught up by the MISSING quantity only (exchange filled minus what
+        #    the tracker already records), so a reconnect never doubles them.
+        sells_done = set()
         for buy_oid, cycle in list(self.tracker.cycles.items()):
             buy = cycle.get("buy") or {}
             sell = cycle.get("sell")
@@ -124,14 +127,20 @@ class ExchangeSyncTask:
                         divergences += 1
                     except Exception as e:
                         self.logger.error(f"audit update buy status {buy_oid}: {e}")
-                # Record aggregate fill info if we see more filled.
+                # Record the part of the fill the tracker does not have yet.
                 filled = float(o.get("filled") or 0.0)
-                if filled > 0:
+                missing = filled - self.tracker.recorded_qty(buy_oid, "buy")
+                if missing > filled * 1e-9:
                     avg = float(o.get("average") or o.get("price") or 0.0)
                     fee_cost = self._fee_cost(o)
                     ts = o.get("datetime") or t0.isoformat()
+                    self.logger.warning(
+                        f"audit buy {buy_oid}: exchange filled {filled} > tracker "
+                        f"{filled - missing}; recording the missing {missing}"
+                    )
                     try:
-                        self.tracker.append_fill(buy_oid, "buy", avg, filled, fee_cost, ts)
+                        self.tracker.append_fill(buy_oid, "buy", avg, missing,
+                                                 fee_cost * missing / filled, ts)
                     except Exception as e:
                         self.logger.error(f"audit append buy fill {buy_oid}: {e}")
 
@@ -147,15 +156,42 @@ class ExchangeSyncTask:
                             divergences += 1
                         except Exception as e:
                             self.logger.error(f"audit update sell status {soid}: {e}")
+                    # One sell can cover several cycles (aggregate a- sells):
+                    # compare against what ALL of them record, and split the
+                    # missing quantity pro-rata by buy qty, as the runner does.
                     filled = float(o.get("filled") or 0.0)
-                    if filled > 0:
-                        avg = float(o.get("average") or o.get("price") or 0.0)
-                        fee_cost = self._fee_cost(o)
-                        ts = o.get("datetime") or t0.isoformat()
-                        try:
-                            self.tracker.append_fill(buy_oid, "sell", avg, filled, fee_cost, ts)
-                        except Exception as e:
-                            self.logger.error(f"audit append sell fill {soid}: {e}")
+                    if soid not in sells_done:
+                        sells_done.add(soid)
+                        covered = [
+                            (b, c) for b, c in self.tracker.cycles.items()
+                            if c["sell"] is not None and c["sell"].get("order_id") == soid
+                        ]
+                        recorded = sum(self.tracker.recorded_qty(b, "sell") for b, _c in covered)
+                        missing = filled - recorded
+                        if missing > filled * 1e-9:
+                            avg = float(o.get("average") or o.get("price") or 0.0)
+                            fee_cost = self._fee_cost(o)
+                            ts = o.get("datetime") or t0.isoformat()
+                            bq = [self.tracker.recorded_qty(b, "buy") for b, _c in covered]
+                            total_bq = sum(bq)
+                            if total_bq <= 0:
+                                self.logger.error(
+                                    f"audit sell {soid}: missing {missing} but covered cycles "
+                                    f"record no buy quantity; not attributed"
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"audit sell {soid}: exchange filled {filled} > tracker "
+                                    f"{recorded} across {len(covered)} cycle(s); recording the missing {missing}"
+                                )
+                                for (b, _c), q in zip(covered, bq):
+                                    share = q / total_bq
+                                    try:
+                                        self.tracker.append_fill(
+                                            b, "sell", avg, missing * share,
+                                            fee_cost * missing / filled * share, ts)
+                                    except Exception as e:
+                                        self.logger.error(f"audit append sell fill {soid} → {b}: {e}")
                     if new_status == "filled":
                         try:
                             self.tracker.archive(buy_oid)
@@ -215,9 +251,14 @@ class ExchangeSyncTask:
             except Exception as e:
                 self.logger.error(f"adopt open {oid} failed: {e}")
 
-        # Also adopt from recent closed if they are known to us but absent.
+        # Also adopt closed bot buys the tracker has never recorded. A buy
+        # that is already archived (history) is a finished or pruned cycle:
+        # adopting it again resurrected sold baskets as phantom holdings.
+        archived = self.tracker.archived_buy_ids()
         for oid, o in closed_by_id.items():
             if oid in self.tracker.cycles:
+                continue
+            if oid in archived:
                 continue
             if not self._is_bot_owned(o, oid, known):
                 continue

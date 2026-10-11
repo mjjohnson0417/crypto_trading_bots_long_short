@@ -240,10 +240,11 @@ class StartupReconciler:
                 f"filled={filled_qty}/{amount} — recording for runner TP flow"
             )
             self._ensure_buy_from_rest(o, oid, status="partially_filled")
-            # Record a synthetic fill row using the aggregate info we have.
-            # (Detailed per-fill history is lost, but avg + total is enough
-            # for later TP math in strategy and for history.)
-            if filled_qty > 0:
+            # Record a synthetic fill row for the part of the executed
+            # quantity the tracker does not have yet (a cycle that already
+            # holds fills must not get them again).
+            missing = filled_qty - self.tracker.recorded_qty(oid, "buy")
+            if missing > filled_qty * 1e-9:
                 avg_price = float(o.get("average") or o.get("price") or 0.0)
                 fee_total = 0.0
                 fee = o.get("fee") or {}
@@ -255,8 +256,8 @@ class StartupReconciler:
                         buy_order_id=oid,
                         side="buy",
                         price=avg_price,
-                        qty=filled_qty,
-                        fee=fee_total,
+                        qty=missing,
+                        fee=fee_total * missing / filled_qty,
                         timestamp=ts,
                     )
                 except Exception as e:
@@ -309,24 +310,28 @@ class StartupReconciler:
                 except Exception as e:
                     self.logger.error(f"update_status closed buy {buy_oid} failed: {e}")
 
-            # If more was filled according to closed record, append delta.
+            # If the closed record shows more filled than the tracker has,
+            # append only the missing quantity (synthetic row: the closed
+            # aggregate's average price, fee pro-rata). Appending the full
+            # filled quantity again doubled already-recorded fills.
             filled_now = float(o.get("filled") or 0.0)
-            # We don't have per-cycle cumulative here easily; append a row
-            # using the closed aggregate if it shows positive filled.
-            # (Idempotency is not perfect — worst case duplicate fill rows
-            # with same totals; downstream sums still work.)
-            if filled_now > 0:
+            missing = filled_now - self.tracker.recorded_qty(buy_oid, side)
+            if missing > filled_now * 1e-9:
                 avg = float(o.get("average") or o.get("price") or 0.0)
                 fee = o.get("fee") or {}
                 fee_cost = float(fee.get("cost") or 0.0) if isinstance(fee, dict) else 0.0
                 ts = o.get("datetime") or datetime.now(timezone.utc).isoformat()
+                self.logger.warning(
+                    f"closed buy {buy_oid}: exchange filled {filled_now} > tracker "
+                    f"{filled_now - missing}; recording the missing {missing}"
+                )
                 try:
                     self.tracker.append_fill(
                         buy_order_id=buy_oid,
                         side=side,
                         price=avg,
-                        qty=filled_now,
-                        fee=fee_cost,
+                        qty=missing,
+                        fee=fee_cost * missing / filled_now,
                         timestamp=ts,
                     )
                 except Exception as e:
@@ -555,9 +560,14 @@ class StartupReconciler:
         while the bot was down and the orders aged out of the live tracker.
         """
         closed_by_id = { (o.get("id") or o.get("order_id")): o for o in closed_orders if o.get("id") or o.get("order_id") }
+        # "Never seen" = in neither the live tracker nor the history: an
+        # archived buy is a finished or pruned cycle and must not be re-adopted.
+        archived = self.tracker.archived_buy_ids()
 
         for oid, o in closed_by_id.items():
             if oid in self.tracker.cycles:
+                continue
+            if oid in archived:
                 continue
             cl = o.get("clientOrderId") or ""
             side = o.get("side")

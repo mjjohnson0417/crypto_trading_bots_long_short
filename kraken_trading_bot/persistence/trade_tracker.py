@@ -107,6 +107,22 @@ class TradeTracker:
         })
         self.save()
 
+    def recorded_qty(self, buy_order_id: str, side: str) -> float:
+        """Sum of the fill quantities already recorded on one side of a cycle."""
+        cycle = self.cycles[buy_order_id]
+        if cycle[side] is None:
+            raise KeyError(f"cycle {buy_order_id} has no {side} side")
+        return sum(float(f['qty']) for f in cycle[side]['fills'])
+
+    def archived_buy_ids(self) -> set:
+        """Buy order ids of every archived cycle (order_cycles_history.json).
+        A corrupt history file raises: adoption decisions depend on it."""
+        if not self.history_file.exists():
+            return set()
+        with open(self.history_file) as f:
+            history = json.load(f)
+        return {c['buy']['order_id'] for c in history}
+
     def archive(self, buy_order_id: str) -> None:
         cycle = self.cycles.pop(buy_order_id, None)
         if cycle is None:
