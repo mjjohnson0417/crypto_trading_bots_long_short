@@ -1,14 +1,17 @@
 """DataManager — the market-data subsystem coordinator.
 
 Owns:
-  - The four DataFrames per symbol (book, trades, ticker, klines).
+  - The per-symbol market data: book (bid/ask dicts), trades (deque),
+    ticker (latest message), klines (REST-seeded DataFrame).
   - The public + private WebSocket wrappers and their tasks.
   - The Kraken Futures public WebSocket and the perp market data
     (`dm.perps`: ticker / trades / book per PF_ product).
   - The two sorters (public / private).
   - The queues between sorters and containers.
   - The REST kline seed at boot.
-  - The DataFrame periodic-snapshot logger (for verification).
+
+Per WS message only dict/deque updates happen; readers do their work on
+their own (periodic) schedule.
 
 Other modules consume `dm.book`, `dm.trades`, `dm.ticker`, `dm.klines`
 directly — those are the public interface.
@@ -52,7 +55,6 @@ class DataManager:
         self.kline_seed_interval = md_cfg['kline_seed_interval']
         self.kline_seed_lookback = int(md_cfg['kline_seed_lookback'])
         self.trade_buffer_maxlen = int(md_cfg['trade_buffer_maxlen'])
-        self.ticker_buffer_maxlen = int(md_cfg['ticker_buffer_maxlen'])
         self.public_ping_health_max_age_seconds = float(
             md_cfg['public_ping_health_max_age_seconds']
         )
@@ -68,17 +70,14 @@ class DataManager:
         self.ws_unhealthy_exit_seconds = float(
             md_cfg['ws_unhealthy_exit_seconds']
         )
-        self.dataframe_log_interval_seconds = float(
-            md_cfg['dataframe_log_interval_seconds']
-        )
 
         self.shutdown = False
         self.tasks: list = []
 
-        # Containers (the DataFrames).
+        # Containers.
         self.book = OrderBookBuffer(self.symbols)
         self.trades = TradeBuffer(self.symbols, maxlen=self.trade_buffer_maxlen)
-        self.ticker = TickerBuffer(self.symbols, maxlen=self.ticker_buffer_maxlen)
+        self.ticker = TickerBuffer(self.symbols)
         self.klines = KlineBuffer(self.symbols)
 
         # Queues — one per public channel, two for private.
@@ -165,7 +164,6 @@ class DataManager:
             (self.book.consume(self.book_queue), 'book_consumer'),
             (self.trades.consume(self.trade_queue), 'trade_consumer'),
             (self.ticker.consume(self.ticker_queue), 'ticker_consumer'),
-            (self._dataframe_logger(), 'dataframe_logger'),
             (self.futures_ws.run(), 'futures_ws'),
             (self.futures_ws.health_watchdog(), 'futures_ws_health'),
             (self._perp_status_logger(), 'perp_status_logger'),
@@ -206,19 +204,6 @@ class DataManager:
                     f"Failed to seed klines for {symbol}: {e}", exc_info=True,
                 )
 
-    async def _dataframe_logger(self) -> None:
-        """Periodic snapshot — emits each symbol's four DataFrames via the
-        DataManager logger. Cadence is `dataframe_log_interval_seconds`.
-        Set `DataManager` to `"OFF"` in config.logging.module_levels to
-        silence."""
-        while not self.shutdown:
-            await asyncio.sleep(self.dataframe_log_interval_seconds)
-            for symbol in self.symbols:
-                self.logger.info(f"{symbol} book:\n{self.book.get(symbol)}")
-                self.logger.info(f"{symbol} trades:\n{self.trades.get(symbol)}")
-                self.logger.info(f"{symbol} ticker:\n{self.ticker.get(symbol)}")
-                self.logger.info(f"{symbol} klines:\n{self.klines.get(symbol)}")
-
     async def _perp_status_logger(self) -> None:
         """One line per perp every `perps.status_log_interval_seconds`:
         mark vs spot mid (basis), funding, book depth, last trade age."""
@@ -232,11 +217,10 @@ class DataManager:
                     t = self.perps.latest_ticker(product)
                     book = self.perps.books[product]
                     trades = self.perps.trades[product]
-                    spot_ticker = self.ticker.get(spot)
-                    if spot_ticker.empty:
+                    last = self.ticker.latest(spot)
+                    if last is None:
                         raise RuntimeError(f"no spot ticker for {spot}")
-                    last = spot_ticker.iloc[-1]
-                    spot_mid = (float(last['bid']) + float(last['ask'])) / 2.0
+                    spot_mid = (last['bid'] + last['ask']) / 2.0
                     basis = (t['markPrice'] / spot_mid - 1) * 100
                     # relative_funding_rate: fraction of notional per hour.
                     fund_hr = t['relative_funding_rate'] * 100

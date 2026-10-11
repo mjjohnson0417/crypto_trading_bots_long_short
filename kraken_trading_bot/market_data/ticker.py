@@ -1,18 +1,17 @@
-"""Per-symbol ticker DataFrame, fed from the public WS ticker channel.
+"""Per-symbol latest ticker, fed from the public WS ticker channel.
 
-Per symbol: a rolling time-indexed DataFrame. Each ticker message appends
-one row. The latest row is the current value.
+Per symbol: the newest ticker message as a plain dict (floats), plus
+timestamp. The strategy reads only the latest bid/ask, so no history is
+kept and nothing but a dict assignment happens per WS message.
 
-Columns mirror Kraken v2 ticker payload keys (timestamp becomes the
-index):
-    bid, bid_qty, ask, ask_qty, last, volume, vwap, low, high,
+Keys mirror the Kraken v2 ticker payload:
+    timestamp, bid, bid_qty, ask, ask_qty, last, volume, vwap, low, high,
     change, change_pct
 """
 import asyncio
 
-import pandas as pd
-
 from logging_config import get_logger
+from market_data.order_book import parse_ts
 
 
 _COLUMNS = [
@@ -22,21 +21,15 @@ _COLUMNS = [
 
 
 class TickerBuffer:
-    """Per-symbol time-indexed rolling DataFrame of ticker messages."""
+    """Per-symbol latest ticker message."""
 
-    def __init__(self, symbols, maxlen: int):
+    def __init__(self, symbols):
         self.logger = get_logger('TickerBuffer')
         self.symbols = [s.upper() for s in symbols]
-        self.maxlen = maxlen
-        self.tickers = {s: self._empty() for s in self.symbols}
+        self.tickers = {s: None for s in self.symbols}
 
-    @staticmethod
-    def _empty() -> pd.DataFrame:
-        df = pd.DataFrame({c: pd.Series(dtype='float64') for c in _COLUMNS})
-        df.index = pd.DatetimeIndex([], name='timestamp', tz='UTC')
-        return df
-
-    def get(self, symbol: str) -> pd.DataFrame:
+    def latest(self, symbol: str):
+        """Newest ticker row, or None before the first message."""
         return self.tickers[symbol.upper()]
 
     async def consume(self, queue: asyncio.Queue) -> None:
@@ -52,8 +45,6 @@ class TickerBuffer:
             symbol = entry['symbol']
             if symbol not in self.tickers:
                 continue
-            ts = pd.to_datetime(entry['timestamp'], utc=True)
             row = {c: float(entry[c]) for c in _COLUMNS if c in entry and entry[c] is not None}
-            new_row = pd.DataFrame([row], index=pd.DatetimeIndex([ts], name='timestamp'))
-            merged = pd.concat([self.tickers[symbol], new_row])
-            self.tickers[symbol] = merged.iloc[-self.maxlen:]
+            row['timestamp'] = parse_ts(entry['timestamp'])
+            self.tickers[symbol] = row

@@ -1,40 +1,48 @@
-"""Per-symbol order book DataFrame, fed from the public WS book channel.
+"""Per-symbol order book, fed from the public WS book channel.
 
-Per symbol: one pandas DataFrame indexed by price, columns:
-    qty       (float)
-    side      ('bid' | 'ask')
-    timestamp (pandas Timestamp, when this level was last written)
+Per symbol: two dicts, bids and asks, {price: qty}, plus the timestamp of
+the last applied message. A WS message only touches dict
+entries — no pandas work on the message path (a pandas row edit per level
+cost ~0.7 ms and could not keep up with busy markets).
 
-Snapshot messages replace the whole DataFrame for the symbol.
-Update messages upsert per-price rows; qty == 0 drops the row.
+Snapshot messages replace both dicts for the symbol.
+Update messages upsert per-price entries; qty == 0 drops the entry.
+
+Readers:
+    levels(symbol, side)  [(price, qty), ...] best-first ('bid' | 'ask')
+    last_update(symbol)   datetime of the last applied message, or None
 """
 import asyncio
-
-import pandas as pd
+from datetime import datetime
 
 from logging_config import get_logger
 
 
+def parse_ts(s: str) -> datetime:
+    """Kraken v2 ISO timestamp ('...Z') → aware UTC datetime."""
+    return datetime.fromisoformat(s)
+
+
 class OrderBookBuffer:
-    """Per-symbol price-indexed DataFrames of the live book."""
+    """Per-symbol bid/ask dicts of the live book."""
 
     def __init__(self, symbols):
         self.logger = get_logger('OrderBookBuffer')
         self.symbols = [s.upper() for s in symbols]
-        self.books = {s: self._empty() for s in self.symbols}
+        self.bids = {s: {} for s in self.symbols}
+        self.asks = {s: {} for s in self.symbols}
+        self.updated = {s: None for s in self.symbols}
 
-    @staticmethod
-    def _empty() -> pd.DataFrame:
-        df = pd.DataFrame({
-            'qty': pd.Series(dtype='float64'),
-            'side': pd.Series(dtype='object'),
-            'timestamp': pd.Series(dtype='datetime64[ns, UTC]'),
-        })
-        df.index = pd.Index([], dtype='float64', name='price')
-        return df
+    def levels(self, symbol: str, side: str) -> list:
+        symbol = symbol.upper()
+        if side == 'bid':
+            return sorted(self.bids[symbol].items(), reverse=True)
+        if side == 'ask':
+            return sorted(self.asks[symbol].items())
+        raise ValueError(f"unknown book side {side!r}")
 
-    def get(self, symbol: str) -> pd.DataFrame:
-        return self.books[symbol.upper()]
+    def last_update(self, symbol: str):
+        return self.updated[symbol.upper()]
 
     async def consume(self, queue: asyncio.Queue) -> None:
         """Pull book messages off the queue and apply them. Long-lived task."""
@@ -49,52 +57,29 @@ class OrderBookBuffer:
         msg_type = msg['type']
         for entry in msg['data']:
             symbol = entry['symbol']
-            if symbol not in self.books:
+            if symbol not in self.bids:
                 continue
-            ts = pd.to_datetime(entry['timestamp'], utc=True)
+            ts = parse_ts(entry['timestamp'])
             if msg_type == 'snapshot':
-                self._apply_snapshot(symbol, entry, ts)
+                self._apply_snapshot(symbol, entry)
             elif msg_type == 'update':
-                self._apply_update(symbol, entry, ts)
+                self._apply_update(symbol, entry)
             else:
                 raise ValueError(f"unknown book msg type {msg_type!r}")
+            self.updated[symbol] = ts
 
-    def _apply_snapshot(self, symbol: str, entry: dict, ts) -> None:
-        rows = []
-        index = []
-        for b in entry['bids']:
-            price = float(b['price'])
-            qty = float(b['qty'])
-            if qty <= 0:
-                continue
-            index.append(price)
-            rows.append({'qty': qty, 'side': 'bid', 'timestamp': ts})
-        for a in entry['asks']:
-            price = float(a['price'])
-            qty = float(a['qty'])
-            if qty <= 0:
-                continue
-            index.append(price)
-            rows.append({'qty': qty, 'side': 'ask', 'timestamp': ts})
-        df = pd.DataFrame(rows, index=pd.Index(index, name='price', dtype='float64'))
-        self.books[symbol] = df
+    def _apply_snapshot(self, symbol: str, entry: dict) -> None:
+        self.bids[symbol] = {float(b['price']): float(b['qty'])
+                             for b in entry['bids'] if float(b['qty']) > 0}
+        self.asks[symbol] = {float(a['price']): float(a['qty'])
+                             for a in entry['asks'] if float(a['qty']) > 0}
 
-    def _apply_update(self, symbol: str, entry: dict, ts) -> None:
-        book = self.books[symbol]
-        for b in entry['bids']:
-            price = float(b['price'])
-            qty = float(b['qty'])
-            if qty == 0:
-                if price in book.index:
-                    book = book.drop(price)
-            else:
-                book.loc[price] = {'qty': qty, 'side': 'bid', 'timestamp': ts}
-        for a in entry['asks']:
-            price = float(a['price'])
-            qty = float(a['qty'])
-            if qty == 0:
-                if price in book.index:
-                    book = book.drop(price)
-            else:
-                book.loc[price] = {'qty': qty, 'side': 'ask', 'timestamp': ts}
-        self.books[symbol] = book
+    def _apply_update(self, symbol: str, entry: dict) -> None:
+        for levels, book in ((entry['bids'], self.bids[symbol]), (entry['asks'], self.asks[symbol])):
+            for lvl in levels:
+                price = float(lvl['price'])
+                qty = float(lvl['qty'])
+                if qty == 0:
+                    book.pop(price, None)
+                else:
+                    book[price] = qty

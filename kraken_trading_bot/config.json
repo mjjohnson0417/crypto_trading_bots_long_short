@@ -107,13 +107,11 @@
     "kline_seed_interval": "15m",
     "kline_seed_lookback": 200,
     "trade_buffer_maxlen": 5000,
-    "ticker_buffer_maxlen": 5000,
     "public_ping_health_max_age_seconds": 10,
     "private_ping_health_max_age_seconds": 90,
     "private_ping_interval_seconds": 30,
     "ws_health_check_interval_seconds": 30,
-    "ws_unhealthy_exit_seconds": 120,
-    "dataframe_log_interval_seconds": 30
+    "ws_unhealthy_exit_seconds": 120
   },
   "indicators": {
     "log_interval_seconds": 30

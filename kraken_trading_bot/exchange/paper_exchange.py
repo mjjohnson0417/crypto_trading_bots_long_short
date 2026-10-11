@@ -147,12 +147,10 @@ class PaperExchange:
 
     def _book_side(self, symbol: str, side: str):
         """Return [(price, qty), ...] best-first for 'bid' or 'ask'."""
-        book = self.dm.book.get(symbol)
-        levels = book[book['side'] == side]
-        if levels.empty:
+        levels = self.dm.book.levels(symbol, side)
+        if not levels:
             raise RuntimeError(f"{symbol}: paper fill needs the order book but {side}s are empty")
-        levels = levels.sort_index(ascending=(side == 'ask'))
-        return list(zip(levels.index.astype(float), levels['qty'].astype(float)))
+        return levels
 
     def _walk_book(self, symbol: str, side: str, qty: float):
         """Fill `qty` against the book. Returns avg price. If the visible
@@ -230,8 +228,7 @@ class PaperExchange:
     # ── Placement ───────────────────────────────────────────────────────
 
     def _new_order(self, symbol, side, ord_type, qty, price, cl_ord_id) -> dict:
-        trades = self.dm.trades.get(symbol)
-        after_id = int(trades['trade_id'].iloc[-1]) if not trades.empty else None
+        after_id = self.dm.trades.last_trade_id(symbol)
         return {
             'id': self._new_order_id(),
             'cl_ord_id': cl_ord_id,
@@ -358,25 +355,21 @@ class PaperExchange:
 
     def _check_fills(self) -> None:
         for symbol in self.symbols:
-            trades = self.dm.trades.get(symbol)
-            if trades.empty:
+            new = self.dm.trades.since_id(symbol, self._last_trade_id[symbol])
+            if not new:
                 continue
-            last_seen = self._last_trade_id[symbol]
-            new = trades if last_seen is None else trades[trades['trade_id'] > last_seen]
-            if new.empty:
-                continue
-            self._last_trade_id[symbol] = int(new['trade_id'].iloc[-1])
+            self._last_trade_id[symbol] = new[-1]['trade_id']
             for order in list(self.orders.values()):
                 if order['status'] != 'open' or order['symbol'] != symbol:
                     continue
                 after = order['after_trade_id']
-                eligible = new if after is None else new[new['trade_id'] > after]
-                if eligible.empty:
+                eligible = new if after is None else [t for t in new if t['trade_id'] > after]
+                if not eligible:
                     continue
                 if order['side'] == 'buy':
-                    hit = bool((eligible['price'] < order['price']).any())
+                    hit = any(t['price'] < order['price'] for t in eligible)
                 else:
-                    hit = bool((eligible['price'] > order['price']).any())
+                    hit = any(t['price'] > order['price'] for t in eligible)
                 if hit:
                     self._fill(order, order['price'], 'maker')
 

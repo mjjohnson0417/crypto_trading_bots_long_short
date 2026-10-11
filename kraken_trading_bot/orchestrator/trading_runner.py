@@ -190,7 +190,9 @@ class TradingRunner:
         for symbol in self.symbols:
             try:
                 kline_df = self.data_manager.klines.get(symbol)
-                self.indicator_calculator.seed_from_klines(symbol, kline_df)
+                self.indicator_calculator.seed_from_klines(
+                    symbol, kline_df, datetime.now(timezone.utc),
+                )
             except Exception as e:
                 self.logger.error(
                     f"Failed to seed indicators for {symbol}: {e}"
@@ -565,28 +567,28 @@ class TradingRunner:
             await asyncio.sleep(self.tick_interval_seconds)
 
     async def _evaluate_symbol(self, symbol: str, now: datetime) -> None:
-        ticker_df = self.data_manager.ticker.get(symbol)
-        if ticker_df.empty:
+        latest = self.data_manager.ticker.latest(symbol)
+        if latest is None:
             return
-        latest = ticker_df.iloc[-1]
-        bid = float(latest['bid'])
-        ask = float(latest['ask'])
+        bid = latest['bid']
+        ask = latest['ask']
         if bid <= 0 or ask <= 0:
             return
         mid_price = (bid + ask) / 2.0
 
         # Book staleness gate.
-        book_df = self.data_manager.book.get(symbol)
-        if not book_df.empty:
-            last_book_ts = book_df['timestamp'].max()
-            book_age = (now - last_book_ts.to_pydatetime()).total_seconds()
+        last_book_ts = self.data_manager.book.last_update(symbol)
+        if last_book_ts is not None:
+            book_age = (now - last_book_ts).total_seconds()
             if book_age > self.max_book_age_seconds:
                 return
 
-        trades_df = self.data_manager.trades.get(symbol)
+        new_trades = self.data_manager.trades.since_time(
+            symbol, self.indicator_calculator.last_ingested(symbol),
+        )
         ticker_data = {'best_bid': bid, 'best_ask': ask}
         indicators = self.indicator_calculator.calculate(
-            symbol, trades_df, ticker_data,
+            symbol, new_trades, ticker_data, now,
         )
 
         buys_allowed, buy_gate_reason = self.daily_trend.buy_gate(symbol, now)

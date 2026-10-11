@@ -1,42 +1,59 @@
-"""Per-symbol trades DataFrame, fed from the public WS trade channel.
+"""Per-symbol trade tape, fed from the public WS trade channel.
 
-Per symbol: a rolling time-indexed DataFrame. Each trade in a message
-appends one row. Bounded by `maxlen` rows via tail-trim.
+Per symbol: a deque (maxlen rows) of plain dicts, oldest first. A WS
+message only appends to the deque — no pandas work on the message path.
 
-Columns mirror Kraken v2 trade payload keys (timestamp becomes the
-index):
-    side, price, qty, ord_type, trade_id
+Row keys mirror the Kraken v2 trade payload:
+    timestamp (aware UTC datetime), side, price, qty, ord_type, trade_id
+
+Readers:
+    last_trade_id(symbol)        newest trade_id, or None
+    since_id(symbol, trade_id)   rows with trade_id > trade_id, oldest first
+    since_time(symbol, ts)       rows with timestamp > ts, oldest first
 """
 import asyncio
-
-import pandas as pd
+from collections import deque
 
 from logging_config import get_logger
+from market_data.order_book import parse_ts
 
 
 class TradeBuffer:
-    """Per-symbol time-indexed rolling DataFrame of trades."""
+    """Per-symbol rolling deque of trades."""
 
     def __init__(self, symbols, maxlen: int):
         self.logger = get_logger('TradeBuffer')
         self.symbols = [s.upper() for s in symbols]
         self.maxlen = maxlen
-        self.buffers = {s: self._empty() for s in self.symbols}
+        self.buffers = {s: deque(maxlen=maxlen) for s in self.symbols}
 
-    @staticmethod
-    def _empty() -> pd.DataFrame:
-        df = pd.DataFrame({
-            'side': pd.Series(dtype='object'),
-            'price': pd.Series(dtype='float64'),
-            'qty': pd.Series(dtype='float64'),
-            'ord_type': pd.Series(dtype='object'),
-            'trade_id': pd.Series(dtype='int64'),
-        })
-        df.index = pd.DatetimeIndex([], name='timestamp', tz='UTC')
-        return df
+    def last_trade_id(self, symbol: str):
+        buf = self.buffers[symbol.upper()]
+        return buf[-1]['trade_id'] if buf else None
 
-    def get(self, symbol: str) -> pd.DataFrame:
-        return self.buffers[symbol.upper()]
+    def since_id(self, symbol: str, trade_id) -> list:
+        buf = self.buffers[symbol.upper()]
+        if trade_id is None:
+            return list(buf)
+        out = []
+        for row in reversed(buf):
+            if row['trade_id'] <= trade_id:
+                break
+            out.append(row)
+        out.reverse()
+        return out
+
+    def since_time(self, symbol: str, ts) -> list:
+        buf = self.buffers[symbol.upper()]
+        if ts is None:
+            return list(buf)
+        out = []
+        for row in reversed(buf):
+            if row['timestamp'] <= ts:
+                break
+            out.append(row)
+        out.reverse()
+        return out
 
     async def consume(self, queue: asyncio.Queue) -> None:
         while True:
@@ -51,16 +68,11 @@ class TradeBuffer:
             symbol = trade['symbol']
             if symbol not in self.buffers:
                 continue
-            ts = pd.to_datetime(trade['timestamp'], utc=True)
-            row = pd.DataFrame(
-                [{
-                    'side': trade['side'],
-                    'price': float(trade['price']),
-                    'qty': float(trade['qty']),
-                    'ord_type': trade['ord_type'],
-                    'trade_id': int(trade['trade_id']),
-                }],
-                index=pd.DatetimeIndex([ts], name='timestamp'),
-            )
-            merged = pd.concat([self.buffers[symbol], row])
-            self.buffers[symbol] = merged.iloc[-self.maxlen:]
+            self.buffers[symbol].append({
+                'timestamp': parse_ts(trade['timestamp']),
+                'side': trade['side'],
+                'price': float(trade['price']),
+                'qty': float(trade['qty']),
+                'ord_type': trade['ord_type'],
+                'trade_id': int(trade['trade_id']),
+            })

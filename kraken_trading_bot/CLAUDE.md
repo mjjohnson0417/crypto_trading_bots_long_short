@@ -111,6 +111,13 @@ Live mode uses `live_trading/` for the tracker. Paper and live state never mix.
 | Kraken spot REST (ccxt) | 15m klines seed, 1d candles, 1h candles (swing targets), fees, balances, prices, order queries | various |
 | Futures REST (public) | instrument list, validated at startup | `fetch_futures_instruments` |
 
+- **Per-message work is dict/deque only (2026-10-11):**
+  - Spot book = bid/ask dicts.
+  - Trades = deque.
+  - Ticker = latest message only.
+  - Indicators are computed once per tick from deques (4h window: sma_1h, sma_4h, slope_1h_pct, width_pct_4h, the regime classifier's inputs).
+  - The old per-message pandas edits (`.loc`/`.drop`/`pd.concat`, ~0.7 ms/msg) put the bot up to 62 s behind the market at about 140k msgs/min.
+  - Never put pandas work back on the message path. The DataFrame snapshot logger was removed.
 - **Perp mapping:** explicit in `perps.products`. CC/USD has no perp.
 - **Book gaps:** a perp book sequence gap triggers a reconnect and resnapshot.
 - **Watchdogs:** each WS has one that exits the process (systemd restarts it) after `ws_unhealthy_exit_seconds` of silence while the network is up.
