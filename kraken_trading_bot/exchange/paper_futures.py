@@ -181,8 +181,6 @@ class PaperFuturesAccount:
             'opened_at': _iso(now),
             'entry_fee': fee,
             'funding': 0.0,
-            'trough': None,
-            'activated_at': None,
         }
         self.open.append(pos)
         self.save()
@@ -235,7 +233,6 @@ class PaperFuturesAccount:
             entry_price=pos['entry_price'], qty=pos['qty'], gross_pnl=gross,
             fees=pos['entry_fee'] + fee, funding=pos['funding'], net_pnl=net,
             return_pct=row['return_pct'], opened_at=pos['opened_at'],
-            activated_at=pos['activated_at'], trough=pos['trough'],
         )
         self.logger.info(
             f"PAPER SHORT cover ({reason}) {pos['symbol']} qty={pos['qty']:.8g} "

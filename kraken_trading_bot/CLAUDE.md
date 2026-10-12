@@ -27,17 +27,21 @@ from `crypto_trading_bots@2df2582`. All long/short development happens here.
 
 ## What the bot does now
 
-Spot DCA ladder on Kraken (`config.json` `symbols`, 10 tokens; CC removed 2026-10-10) with a daily
-trend gate. Strategy: `strategy/hybrid_grid.py`, runner:
-`orchestrator/trading_runner.py`.
+Spot grid ladder on Kraken (`config.json` `symbols`, 10 tokens; CC removed 2026-10-10) that buys
+all the way down, plus paper short baskets on perps below the 50-day. Strategy:
+`strategy/hybrid_grid.py` + `strategy/short_grid.py`, runner `orchestrator/trading_runner.py`.
+Changed 2026-10-12 from strategy_lab `analysis/minute_basket.py` ("longs all the way down, shorts only
+below the 50-day, 0.5 % / 0.1 %, shorts 2× size and 2× target"; 2021 – mid-2026 replay +586 %,
+max drawdown −63 %, 2022 −60 %; minute replay is ~15–25 % optimistic, shorts priced from spot).
 
-- **5-state classifier** (`state_machine/regime_classifier.py`): sma_1h vs
-  sma_4h, slope ±0.3%, 4h width < 1% ⇒ SIDEWAYS; 90s hysteresis. Ladder runs
-  in every state except STRONG_UPTREND (chase is disabled in config).
-  Down states use anchored spacing. The classifier flips about 16×/token/day
-  and has no directional edge (strategy_lab finding); it mainly throttles.
-- **Ladder:** 5 rungs, `spacing_pct` 1.5, `proximity_pct` 1.0, each rung
-  `position_size_pct` 0.25% of portfolio. Ratchets with price.
+- **Ladder = fixed grid** (`hybrid_grid.ladder`): level k at (1 + `spacing_pct`)^k, 0.5 % apart.
+  `rung_count` (10) resting limit buys at the highest free levels below the mid; a level holding a
+  filled, unsold ladder buy is not bought again until the basket sells (no stacking at one price).
+  Each rung `ladder_defaults.position_size_pct` 0.1 % of the spot portfolio value. The grid ignores
+  the regime (no strong-uptrend cancels, no downtrend rebuilds) and buys continue all the way down.
+  Journal reason `grid_rung` (place) / `grid_move` (cancel).
+- **5-state classifier** (`state_machine/regime_classifier.py`): still computed and journaled
+  (`regime_change`), and still drives the chase (disabled in config). It no longer affects the ladder.
 - **Exit:** one aggregate market sell per symbol when mid ≥ weighted avg
   cost × (1 + buy fee% + **taker** fee% + target%). No stop-losses. The target
   comes from `market_data/swing_target.py` (SwingTargets, config `aggregate_target`,
@@ -51,30 +55,35 @@ trend gate. Strategy: `strategy/hybrid_grid.py`, runner:
   - `ladder_defaults.profit_pct` (3) is now only encoded in ladder buy cl_ord_ids.
   - Backtest (2022 – mid-2026, $50K, classic fee tiers): 267% vs 176% for fixed +3%,
     worst drop −15.3% vs −17.6%; worse worst single-year drop (−22% vs −18%).
-- **200-day buy gate** (`market_data/daily_trend.py`, DailyTrendGate):
-  - Rule: buys are paused while the previous completed UTC day's close is below its 200-day SMA.
-  - While paused: resting buys are canceled (re-swept every 60s); exits still run.
-  - Startup fails if daily candles can't load. Buys pause if the daily data is more than 26h stale.
-  - SMA50 is computed and logged for the future short gate.
+- **200-day buy gate** (`market_data/daily_trend.py`, DailyTrendGate): **off** since 2026-10-12
+  (`daily_trend.buy_gate_enabled: false`; buys go all the way down). When on: buys pause while the
+  previous completed UTC day's close is below its 200-day SMA, resting buys are canceled (re-swept
+  every 60s), exits still run. DailyTrendGate still loads at startup (fails if daily candles can't
+  load; needs 200 days of history) for the 50-day short gate and the +2 % target.
 - **Fees** (`exchange/fee_cache.py`): account volume-tier rates from Kraken, refreshed hourly. As of 2026-10-10: maker 0.20%, taker 0.35%. Fill fees are read from Kraken WS v2 `fees` (per execution) and `last_price`; there is **no `fee` field**. The original bot reads `fee`, so it records every fill fee as $0.
 
-## Paper short grid (dry run only)
+## Paper short baskets (dry run only)
 
-Trailing short grid on **Kraken Futures perps**, a copy of strategy_lab's
-`lab/short_grid_core.py` mode 3 (settings from `analysis/export_rules_chart.py`).
-Code: `strategy/short_grid.py` (rules) + `exchange/paper_futures.py` (paper
-account); config `short_grid`; runner task `short_grid`.
+Short baskets on **Kraken Futures perps** (since 2026-10-12; replaced the trailing short grid).
+Code: `strategy/short_grid.py` (rules) + `exchange/paper_futures.py` (paper account); config
+`short_grid`; runner task `short_grid`.
 
-- **Gate** (`short_grid.gate`): `below_short_sma` = previous daily close < 50-day SMA
-  (the backtested choice); `below_either_sma` = below the 50d or the 200d. Stale
-  daily data (> 26h) blocks new shorts. Shorts are NOT closed when the gate turns off.
-- **Entry:** once per minute (lab used 1-minute closes) on the perp book mid:
-  level = floor(ln(mid)/ln(1.01)); a cross down into a level with no open short
-  opens one. Size 0.5% of total equity; skipped if short notional would exceed
-  30% of total equity. Total equity = spot paper equity + short equity (one pot).
-- **Exit,** each short on its own, every tick: 3% hard stop until ahead by
-  5% + round-trip fees (2 × 0.05% taker); then the stop is dropped and it covers
-  when mid rises 8% off its trough, never below 0.5% + fees profit.
+- **Gate** (`short_grid.gate`): `below_short_sma` = previous daily close < 50-day SMA;
+  `below_either_sma` = below the 50d or the 200d. Stale daily data (> 26h) blocks new shorts.
+  The gate only stops new shorts; open baskets keep their exits.
+- **Entry,** every tick, on the perp book mid: the same 0.5 % grid as the long ladder,
+  level = floor(ln(mid)/ln(1.005)). Each level the mid falls through since the previous tick opens
+  one short (none if a short of that level is already open) of `size_pct` 0.2 % (2× the long rung)
+  of total equity; skipped if short notional would exceed `cap_pct` (100 %) of total equity. Total
+  equity = spot portfolio value + short equity (one pot). The first sample after a restart only
+  sets the level.
+- **Exit:** all open shorts of a token are ONE basket (qty-weighted average entry), covered all at
+  once at market when
+  - target: mid ≤ avg × (1 − taker − drop target × `target_multiplier` (2)); drop target =
+    `SwingTargets.drop_target` = clip(median of the last 6 completed 2 % hourly DROPS, 1 %, 8 %),
+    the mirror of the long swing target (`warmup_pct` 3 % with fewer than 6 drops or stale data);
+  - stop: mid ≥ avg × (1 + `stop_pct` 10 %).
+  Journal `short_basket_close` (reason `basket_target` / `basket_stop`), then one `short_cover` per short.
 - **Fills** walk the live perp book (taker). Qty rounds down to the contract
   precision. **Funding** is credited hourly: qty × mark × `relative_funding_rate`.
 - **Not modelled:** margin, liquidation (initial margin is only reported).
@@ -132,16 +141,17 @@ Never rotated — the text log keeps only ~30 MB (5 MB × 6). Use the journal, n
 the text log, to reconstruct trades.
 
 - **Decisions:** `ladder_action` per placed/canceled order with `reason`
-  (`build`, `refill`, `ratchet_up`, `excess_rung`, `enter_strong_uptrend`,
-  `enter_downtrend`, `exit_downtrend`, `buy_gate_paused`, `aggregate_target`, chase
-  reasons), `mid`, `regime`, `buys_allowed`, dispatch `error`. The aggregate sell
+  (`grid_rung`, `grid_move`, `buy_gate_paused`, `aggregate_target`, chase reasons; before
+  2026-10-12 also `build`, `refill`, `ratchet_up`, `excess_rung`, `enter_strong_uptrend`,
+  `enter_downtrend`, `exit_downtrend`), `mid`, `regime`, `buys_allowed`, dispatch `error`. The aggregate sell
   also has `avg_cost`, `target_price`, `cycles`, `buy_fees`, `taker_fee_pct`,
   `profit_pct`, `target_rule` (`swing` / `below_short_sma` / `warmup` / `stale`), `target_reason`.
-- **State:** `regime_change`, `buy_gate`, `short_gate` (flips only), `swing_target`
-  (when a token's target rule or value changes), `bot_start` (settings).
+- **State:** `regime_change`, `buy_gate`, `short_gate` (flips only), `swing_target` /
+  `drop_target` (when a token's target rule or value changes), `bot_start` (settings).
 - **Results:** `fill` (every fill, both sides), `ladder_closed` (realized P&L of each
-  aggregate sell), `short_open` / `short_activated` / `short_cover` (with trigger mid,
-  fill price, slippage, net P&L), `short_funding` (hourly).
+  aggregate sell), `short_open` / `short_basket_close` / `short_cover` (with trigger mid,
+  fill price, slippage, net P&L), `short_funding` (hourly). `short_activated` is from the old
+  trailing grid (before 2026-10-12).
 - The text log gets one `<symbol> decisions mid=… regime=… buys=…: N× action:reason`
   line per tick that acts, and `regime A → B` lines.
 - `order_cycles_history.json` still collects zero-fill canceled rungs (archived on

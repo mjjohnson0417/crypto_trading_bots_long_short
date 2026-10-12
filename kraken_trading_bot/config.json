@@ -31,9 +31,8 @@
   "hybrid_grid": {
     "hysteresis_seconds": 90,
     "ladder": {
-      "rung_count": 5,
-      "spacing_pct": 1.5,
-      "proximity_pct": 1.0
+      "rung_count": 10,
+      "spacing_pct": 0.5
     },
     "chase": {
       "enabled": false,
@@ -42,7 +41,7 @@
       "spacing_pct": 0.6
     },
     "ladder_defaults": {
-      "position_size_pct": 0.25,
+      "position_size_pct": 0.1,
       "profit_pct": 3.0
     }
   },
@@ -52,7 +51,8 @@
     "fetch_limit": 720,
     "refresh_interval_seconds": 3600,
     "max_staleness_hours": 26,
-    "buy_gate_cancel_retry_seconds": 60
+    "buy_gate_cancel_retry_seconds": 60,
+    "buy_gate_enabled": false
   },
   "aggregate_target": {
     "swing_theta_pct": 2.0,
@@ -69,15 +69,12 @@
   "short_grid": {
     "enabled": true,
     "gate": "below_short_sma",
-    "spacing_pct": 1.0,
-    "size_pct": 0.5,
-    "cap_pct": 30.0,
-    "stop_pct": 3.0,
-    "trail_activate_pct": 5.0,
-    "trail_pct": 8.0,
-    "trail_floor_pct": 0.5,
+    "spacing_pct": 0.5,
+    "size_pct": 0.2,
+    "cap_pct": 100.0,
+    "stop_pct": 10.0,
+    "target_multiplier": 2.0,
     "taker_fee_pct": 0.05,
-    "entry_interval_seconds": 60,
     "max_perp_book_age_seconds": 30
   },
   "perps": {
@@ -148,7 +145,7 @@
       "RulesTradingBot": "INFO",
       "ShortGrid": "INFO",
       "ShutdownManager": "WARNING",
-    "SwingTargets": "INFO",
+      "SwingTargets": "INFO",
       "StartupReconciler": "INFO",
       "TickerBuffer": "WARNING",
       "TradeBuffer": "WARNING",

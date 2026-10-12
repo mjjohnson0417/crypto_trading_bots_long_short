@@ -3,10 +3,17 @@
 The runner constructs once with `symbols`, `config`, `fee_cache`,
 `data_manager`, `journal`, `swing_targets`. Then calls `evaluate(symbol, indicators, mid_price,
 orders, cached_balance, now, buys_allowed, buy_gate_reason)` per tick.
-`buys_allowed` comes from the daily-trend gate (200-day SMA): while it is
-False, no new buys are placed, resting buys are canceled, and exits
-still run. Returns a list of plain-dict
-actions for the runner to dispatch against `order_ops`.
+`buys_allowed` comes from the daily-trend gate (200-day SMA, or always True
+when daily_trend.buy_gate_enabled is false): while it is False, no new buys
+are placed, resting buys are canceled, and exits still run. Returns a list of
+plain-dict actions for the runner to dispatch against `order_ops`.
+
+Ladder = a FIXED grid of buy prices per token, level k at (1 + spacing)^k.
+`rung_count` resting limit buys sit at the highest free levels below the
+mid; a level holding a filled, unsold ladder buy is not bought again until
+the basket sells (so the bot never stacks buys at one price). The grid does
+not move with the regime: buys continue all the way down. All filled ladder
+buys of a token form one basket, sold at market at the aggregate target.
 
 Action dicts (every action also carries "reason" and "regime" for the
 trade journal; the runner ignores keys it does not dispatch on):
@@ -22,18 +29,13 @@ cl_ord_id convention (capped at Kraken's 18-char free-text limit):
 """
 from __future__ import annotations
 
+import math
 import uuid
 from typing import List, Optional
 
 from logging_config import get_logger
 from price_calculator import calculate_tp_price, get_tick_size
-from state_machine.regime_classifier import (
-    RegimeClassifier,
-    STATE_STRONG_UPTREND,
-    STATE_STRONG_DOWNTREND,
-    STATE_UPTREND,
-    STATE_DOWNTREND,
-)
+from state_machine.regime_classifier import RegimeClassifier, STATE_STRONG_UPTREND
 
 
 _ACTIVE_STATUSES = ('pending_new', 'new', 'partially_filled')
@@ -42,15 +44,6 @@ _ACTIVE_STATUSES = ('pending_new', 'new', 'partially_filled')
 class _ChaseState:
     def __init__(self):
         self.strong_uptrend_start_price: Optional[float] = None
-        self.last_confirmed_state: Optional[str] = None
-
-
-class _LadderState:
-    def __init__(self):
-        self.anchor_price: Optional[float] = None
-        self.spacing_distance: Optional[float] = None
-        self.is_anchored: bool = False
-        self.last_adjust_price: Optional[float] = None
         self.last_confirmed_state: Optional[str] = None
 
 
@@ -80,7 +73,9 @@ class HybridGridStrategy:
         self.hysteresis_seconds = int(hcfg['hysteresis_seconds'])
         self.ladder_rung_count = int(h_ladder['rung_count'])
         self.ladder_spacing_pct = float(h_ladder['spacing_pct'])
-        self.ladder_proximity_pct = float(h_ladder['proximity_pct'])
+        if self.ladder_rung_count <= 0 or self.ladder_spacing_pct <= 0:
+            raise ValueError("hybrid_grid.ladder rung_count and spacing_pct must be > 0")
+        self._log_g = math.log(1.0 + self.ladder_spacing_pct / 100.0)
         self.chase_enabled = bool(h_chase['enabled'])
         self.chase_position_size_pct = float(h_chase['position_size_pct'])
         self.chase_profit_pct = float(h_chase['profit_pct'])
@@ -102,7 +97,6 @@ class HybridGridStrategy:
             for s in self.symbols
         }
         self.chase = {s: _ChaseState() for s in self.symbols}
-        self.ladder = {s: _LadderState() for s in self.symbols}
         self.buy_gate = {s: _BuyGateState() for s in self.symbols}
         # Last confirmed regime per symbol, for transition logging.
         self.regime = {s: None for s in self.symbols}
@@ -130,13 +124,9 @@ class HybridGridStrategy:
                     actions.append(a)
         else:
             self._buy_gate_allowed(symbol, buy_gate_reason)
-            if state == STATE_STRONG_UPTREND:
-                if self.chase_enabled:
-                    actions.extend(self._chase_decisions(symbol, mid_price, orders, cached_balance))
-            else:
-                actions.extend(
-                    self._ladder_decisions(symbol, mid_price, orders, cached_balance)
-                )
+            if state == STATE_STRONG_UPTREND and self.chase_enabled:
+                actions.extend(self._chase_decisions(symbol, mid_price, orders, cached_balance))
+            actions.extend(self._ladder_decisions(symbol, mid_price, orders, cached_balance))
 
         actions.extend(self._exit_decisions(symbol, mid_price, orders, now))
         for a in actions:
@@ -178,12 +168,11 @@ class HybridGridStrategy:
     def _encode_chase_sell_cl_ord_id() -> str:
         return f"s-{uuid.uuid4().hex[:8]}"
 
-    # ── State-transition handling ───────────────────────────────────────
+    # ── State-transition handling (chase only; the ladder ignores the regime) ──
 
     def _handle_state_transitions(self, symbol, state, mid_price, orders) -> List[dict]:
         actions: List[dict] = []
         chase = self.chase[symbol]
-        ladder = self.ladder[symbol]
 
         # Chase floor capture/release.
         if state == STATE_STRONG_UPTREND and chase.last_confirmed_state != STATE_STRONG_UPTREND:
@@ -197,38 +186,6 @@ class HybridGridStrategy:
                                 "order_id": buy_oid, "reason": "exit_strong_uptrend"})
 
         chase.last_confirmed_state = state
-
-        # Ladder transition rules: cancel-all on entering STRONG_UPTREND,
-        # entering Down regime (then rebuild anchored), exiting Down regime.
-        prev = ladder.last_confirmed_state
-        if state == STATE_STRONG_UPTREND:
-            for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'ladder'):
-                actions.append({"action": "cancel_order", "symbol": symbol,
-                                "order_id": buy_oid, "reason": "enter_strong_uptrend"})
-            ladder.anchor_price = None
-            ladder.spacing_distance = None
-            ladder.is_anchored = False
-            ladder.last_adjust_price = None
-        elif (state in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)
-              and prev not in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)):
-            for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'ladder'):
-                actions.append({"action": "cancel_order", "symbol": symbol,
-                                "order_id": buy_oid, "reason": "enter_downtrend"})
-            ladder.anchor_price = float(mid_price)
-            ladder.is_anchored = True
-            ladder.spacing_distance = float(mid_price) * (self.ladder_spacing_pct / 100.0)
-            ladder.last_adjust_price = None
-        elif (prev in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)
-              and state not in (STATE_DOWNTREND, STATE_STRONG_DOWNTREND)):
-            for buy_oid, _cycle in self._active_buys_by_rule(symbol, orders, 'ladder'):
-                actions.append({"action": "cancel_order", "symbol": symbol,
-                                "order_id": buy_oid, "reason": "exit_downtrend"})
-            ladder.anchor_price = None
-            ladder.spacing_distance = None
-            ladder.is_anchored = False
-            ladder.last_adjust_price = None
-
-        ladder.last_confirmed_state = state
         return actions
 
     # ── Daily-trend buy gate ────────────────────────────────────────────
@@ -236,15 +193,13 @@ class HybridGridStrategy:
     def _buy_gate_paused(self, symbol, reason, orders, now) -> List[dict]:
         """Buys are paused: cancel every resting buy for the symbol on
         the flip, and re-sweep every buy_gate_cancel_retry_seconds in
-        case a cancel did not take. The ladder's last adjust price is
-        cleared so it rebuilds from the current mid when buys resume."""
+        case a cancel did not take."""
         gate = self.buy_gate[symbol]
         flipped = gate.allowed is not False
         if flipped:
             self.logger.warning(f"{symbol} buys PAUSED — {reason}")
             self.journal.write('buy_gate', symbol=symbol, allowed=False, reason=reason)
         gate.allowed = False
-        self.ladder[symbol].last_adjust_price = None
 
         if (not flipped and gate.last_cancel_sweep is not None
                 and (now - gate.last_cancel_sweep).total_seconds()
@@ -298,129 +253,56 @@ class HybridGridStrategy:
     # ── Ladder decisions ────────────────────────────────────────────────
 
     def _ladder_decisions(self, symbol, mid_price, orders, cached_balance) -> List[dict]:
-        actions: List[dict] = []
-        ladder = self.ladder[symbol]
-
-        # Active ladder buy prices below mid.
-        active_ladder_buys = [
-            (buy_oid, cycle)
-            for buy_oid, cycle in self._active_buys_by_rule(symbol, orders, 'ladder')
-        ]
-        existing_buys = sorted(
-            (cycle['buy']['limit_price'] for _, cycle in active_ladder_buys),
-        )
-
-        # Proximity gate.
-        if (ladder.last_adjust_price is not None
-                and ladder.last_adjust_price > 0
-                and len(existing_buys) >= self.ladder_rung_count):
-            move = abs(mid_price - ladder.last_adjust_price) / ladder.last_adjust_price * 100.0
-            if move < self.ladder_proximity_pct:
-                return []
-
-        # Desired rung target prices.
-        desired = self._desired_rung_prices(symbol, mid_price)
-        below = [p for p in existing_buys if p < mid_price]
-        forbidden = set(below)
-        threshold = self.ladder_spacing_pct / 100.0 - 1e-9
-        candidates = [
-            p for p in desired
-            if p < mid_price
-            and not any(abs(p - f) / max(f, 1e-9) < threshold for f in forbidden)
-        ]
-        candidates.sort(reverse=True)  # top-down
-
-        # Direction (for ratcheting).
-        last = ladder.last_adjust_price
-        if last is None or last <= 0:
-            direction = "flat"
-        elif mid_price > last:
-            direction = "up"
-        elif mid_price < last:
-            direction = "down"
-        else:
-            direction = "flat"
-
-        target = self.ladder_rung_count
-        active = len(below)
-
-        # Excess: cancel lowest first.
-        cancels_prices: List[float] = []
-        cancel_reason: dict = {}
-        if active > target:
-            for price in below[:active - target]:
-                cancels_prices.append(price)
-                cancel_reason[price] = "excess_rung"
-            active -= len(cancels_prices)
-
-        missing = max(0, target - active)
-        places_prices: List[float] = []
-        place_reason: dict = {}
-        fill_reason = "build" if active == 0 else "refill"
-
-        if direction == "up":
-            for price in candidates[:missing]:
-                places_prices.append(price)
-                place_reason[price] = fill_reason
-            if missing == 0 and candidates and below:
-                new_top = candidates[0]
-                if new_top > max(below):
-                    places_prices.append(new_top)
-                    place_reason[new_top] = "ratchet_up"
-                    cancels_prices.append(below[0])
-                    cancel_reason[below[0]] = "ratchet_up"
-        else:
-            bottom_up = sorted(candidates)
-            for price in bottom_up[:missing]:
-                places_prices.append(price)
-                place_reason[price] = fill_reason
-
-        places_prices = [p for p in places_prices if p < mid_price]
-        places_prices = sorted(set(places_prices), reverse=True)
-        cancels_prices = sorted(set(cancels_prices))
-
-        ladder.last_adjust_price = float(mid_price)
-
-        # Resolve cancel prices to order_ids.
-        price_to_oid = {cycle['buy']['limit_price']: buy_oid
-                        for buy_oid, cycle in active_ladder_buys}
-        for price in cancels_prices:
-            oid = price_to_oid.get(price)
-            if oid:
-                actions.append({"action": "cancel_order", "symbol": symbol,
-                                "order_id": oid, "reason": cancel_reason[price]})
-
-        # Emit places. Sizing per rung.
-        for price in places_prices:
-            size_usd = cached_balance * self.ladder_position_size_pct / 100.0
-            if size_usd <= 0:
-                break
-            qty = size_usd / price
-            cl_ord_id = self._encode_buy_cl_ord_id('ladder', self.ladder_profit_pct)
-            actions.append({"action": "place_limit_buy", "symbol": symbol,
-                            "qty": qty, "price": price, "cl_ord_id": cl_ord_id,
-                            "reason": place_reason[price]})
-
-        return actions
-
-    def _desired_rung_prices(self, symbol, mid_price) -> List[float]:
-        ladder = self.ladder[symbol]
+        """Keep a resting buy at each of the `rung_count` highest free grid
+        levels below the mid. Free = no filled, unsold ladder buy at that
+        level. Resting buys at any other level are canceled."""
         if mid_price <= 0:
             return []
-        out: List[float] = []
-        if ladder.is_anchored and ladder.spacing_distance:
-            dist = ladder.spacing_distance
-            for i in range(1, self.ladder_rung_count + 1):
-                p = mid_price - i * dist
-                if p < mid_price:
-                    out.append(p)
-        else:
-            spacing = self.ladder_spacing_pct / 100.0
-            for i in range(1, self.ladder_rung_count + 1):
-                p = mid_price * (1 - i * spacing)
-                if p < mid_price:
-                    out.append(p)
-        return out
+        resting = {}          # level → buy order_id
+        held = set()          # levels with a filled, unsold ladder buy
+        for buy_oid, cycle in orders.items():
+            if cycle['symbol'] != symbol or cycle['sell'] is not None:
+                continue
+            buy = cycle['buy']
+            meta = self._decode_buy_cl_ord_id(buy['cl_ord_id'])
+            if meta is None or meta[0] != 'ladder':
+                continue
+            if buy['status'] in _ACTIVE_STATUSES:
+                resting[self._grid_level(buy['limit_price'])] = buy_oid
+            elif buy['status'] == 'filled':
+                held.add(self._grid_level(buy['limit_price']))
+
+        k = math.floor(math.log(mid_price) / self._log_g)
+        if math.exp(k * self._log_g) >= mid_price:
+            k -= 1
+        desired = []
+        while len(desired) < self.ladder_rung_count:
+            if k not in held:
+                desired.append(k)
+            k -= 1
+
+        actions: List[dict] = []
+        for level, oid in resting.items():
+            if level not in desired:
+                actions.append({"action": "cancel_order", "symbol": symbol,
+                                "order_id": oid, "reason": "grid_move"})
+        size_usd = cached_balance * self.ladder_position_size_pct / 100.0
+        if size_usd <= 0:
+            return actions
+        for level in desired:
+            if level in resting:
+                continue
+            price = math.exp(level * self._log_g)
+            actions.append({"action": "place_limit_buy", "symbol": symbol,
+                            "qty": size_usd / price, "price": price,
+                            "cl_ord_id": self._encode_buy_cl_ord_id('ladder', self.ladder_profit_pct),
+                            "reason": "grid_rung", "level": level})
+        return actions
+
+    def _grid_level(self, price: float) -> int:
+        """Grid level of a buy's limit price (orders are rounded down to the
+        price tick, far finer than the grid spacing)."""
+        return round(math.log(price) / self._log_g)
 
     # ── Exit decisions ──────────────────────────────────────────────────
 

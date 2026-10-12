@@ -95,8 +95,10 @@ class TradingRunner:
         # Append-only record of every decision and fill (never rotated).
         self.journal = TradeJournal(tracker_dir)
         self.indicator_calculator = IndicatorCalculator(self.symbols)
-        # 200-day buy gate. main.py awaits daily_trend.initialize() before
+        # Daily trend data (200-day buy gate when enabled, 50-day short gate
+        # and +2 % target). main.py awaits daily_trend.initialize() before
         # the runner starts, so the bot never trades without it.
+        self.buy_gate_enabled = bool(config['daily_trend']['buy_gate_enabled'])
         self.daily_trend = DailyTrendGate(
             self.symbols, exchange_connection.rest_exchange,
             config['daily_trend'],
@@ -115,7 +117,7 @@ class TradingRunner:
             swing_targets=self.swing_targets,
         )
 
-        # Trailing short grid on perps. Paper only: there is no live
+        # Short baskets on perps below the 50-day. Paper only: there is no live
         # Kraken Futures order code, so live mode refuses to run it.
         short_cfg = config['short_grid']
         if bool(short_cfg['enabled']):
@@ -135,6 +137,7 @@ class TradingRunner:
                 config=short_cfg,
                 perps=data_manager.perps,
                 daily_trend=self.daily_trend,
+                swing_targets=self.swing_targets,
                 account=self.short_account,
                 journal=self.journal,
             )
@@ -591,7 +594,10 @@ class TradingRunner:
             symbol, new_trades, ticker_data, now,
         )
 
-        buys_allowed, buy_gate_reason = self.daily_trend.buy_gate(symbol, now)
+        if self.buy_gate_enabled:
+            buys_allowed, buy_gate_reason = self.daily_trend.buy_gate(symbol, now)
+        else:
+            buys_allowed, buy_gate_reason = True, "buy gate disabled (daily_trend.buy_gate_enabled=false)"
 
         actions = self.strategy.evaluate(
             symbol=symbol,

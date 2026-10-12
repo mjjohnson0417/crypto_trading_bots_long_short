@@ -5,10 +5,12 @@ the bot service is running.
 
     venv/bin/python tools/positions.py
 
-Longs are marked the way the bot's exit is checked: spot mid. Net P&L is
+Longs are marked the way the bot's exit is checked: spot mid.
+Shorts are shown per token basket (average entry, cover target, basket stop). Net P&L is
 after the buy fees and the estimated taker fee of the market sell (rate
 from the bot's last FeeCache log line). Shorts are marked at the perp mid;
-net is after both taker fees (exit estimated) plus funding received.
+net is after both taker fees (exit estimated) plus funding received. The short
+cover target uses the bot's last journaled drop target.
 """
 import json
 import re
@@ -76,6 +78,19 @@ def swing_targets() -> dict:
                 continue
             ev = json.loads(line)
             if ev['event'] == 'swing_target':
+                out[ev['symbol']] = ev
+    return out
+
+
+def drop_targets() -> dict:
+    """{symbol: latest drop_target journal event}."""
+    out = {}
+    with open(STATE / 'journal.jsonl') as f:
+        for line in f:
+            if '"drop_target"' not in line:
+                continue
+            ev = json.loads(line)
+            if ev['event'] == 'drop_target':
                 out[ev['symbol']] = ev
     return out
 
@@ -189,34 +204,40 @@ def main() -> None:
     long_total = spot_equity - starting_cash
 
     # ── Shorts ──────────────────────────────────────────────────────────
-    rt_fee = 2 * float(sg['taker_fee_pct'])
-    print(f"\n{BOLD}SHORTS — open perp shorts{RESET}")
+    # Each token's open shorts are one basket (strategy/short_grid.py): covered at
+    # avg entry × (1 − taker − drop target × multiplier), or stopped at avg entry × (1 + stop).
+    taker = float(sg['taker_fee_pct'])
+    print(f"\n{BOLD}SHORTS — open perp short baskets{RESET}")
     short_unreal_net = 0.0
     short_unreal_gross = 0.0
     if not shorts['open']:
         print("  none")
-    for p in sorted(shorts['open'], key=lambda p: (p['symbol'], p['opened_at'])):
-        mid = perp[p['product']]
-        entry = p['entry_price']
-        gross = p['qty'] * (entry - mid)
-        exit_fee = p['qty'] * mid * float(sg['taker_fee_pct']) / 100
-        net = gross - p['entry_fee'] - exit_fee + p['funding']
+    by_sym = defaultdict(list)
+    for p in shorts['open']:
+        by_sym[p['symbol']].append(p)
+    drops = drop_targets()
+    for sym in sorted(by_sym):
+        ps = by_sym[sym]
+        mid = perp[ps[0]['product']]
+        qty = sum(p['qty'] for p in ps)
+        avg = sum(p['qty'] * p['entry_price'] for p in ps) / qty
+        gross = sum(p['qty'] * (p['entry_price'] - mid) for p in ps)
+        fees_in = sum(p['entry_fee'] for p in ps)
+        funding = sum(p['funding'] for p in ps)
+        net = gross - fees_in - qty * mid * taker / 100 + funding
         short_unreal_gross += gross
         short_unreal_net += net
-        if p['trough'] is None:
-            stop = entry * (1 + float(sg['stop_pct']) / 100)
-            act = entry * (1 - (rt_fee + float(sg['trail_activate_pct'])) / 100)
-            state = (f"stop {stop:.6g} ({(stop / mid - 1) * 100:+.2f}%)  "
-                     f"trail starts {act:.6g} ({(act / mid - 1) * 100:+.2f}%)")
-        else:
-            floor_px = entry * (1 - (rt_fee + float(sg['trail_floor_pct'])) / 100)
-            cover = min(p['trough'] * (1 + float(sg['trail_pct']) / 100), floor_px)
-            state = (f"TRAILING since {et(p['activated_at'])} ET, low {p['trough']:.6g}, "
-                     f"covers at {cover:.6g} ({(cover / mid - 1) * 100:+.2f}%)")
-        print(f"  {p['symbol']:<9} {et(p['opened_at'])} ET  qty {p['qty']:<8g} "
-              f"entry {entry:<10.6g} mid {mid:<10.6g} {pct((1 - mid / entry) * 100)}  "
-              f"net {money(net)}")
-        print(f"      {DIM}{state}  funding {p['funding']:+.4f}{RESET}")
+        stop = avg * (1 + float(sg['stop_pct']) / 100)
+        line = (f"stop {stop:.6g} ({(stop / mid - 1) * 100:+.2f}%)")
+        d = drops.get(sym)
+        if d is not None:
+            tgt_pct = d['target_pct'] * float(sg['target_multiplier'])
+            cover = avg * (1 - taker / 100 - tgt_pct / 100)
+            line = (f"covers at {cover:.6g} ({(cover / mid - 1) * 100:+.2f}%, "
+                    f"{tgt_pct:.2f}% below avg)  " + line)
+        print(f"  {BOLD}{sym:<9}{RESET} {len(ps)} shorts  qty {qty:<10.6g} avg entry {avg:<10.6g} "
+              f"mid {mid:<10.6g} {pct((1 - mid / avg) * 100)}  net {money(net)}")
+        print(f"      {DIM}{line}  funding {funding:+.4f}  first {et(min(p['opened_at'] for p in ps))} ET{RESET}")
 
     realized = sum(h['net_pnl'] for h in shorts_hist)
     short_equity = shorts['cash'] + short_unreal_gross   # same as the bot's equity()
